@@ -54,6 +54,192 @@ pub fn segments_to_path(segments: &[PathSegment]) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
+/// Build a `tiny_skia::Path` from raw vertices (f64 Nx2) and codes (u8 N) blobs.
+///
+/// Codes follow the matplotlib convention:
+/// - 1 = MOVETO
+/// - 2 = LINETO
+/// - 3 = CURVE3 (quadratic Bézier, consumes next vertex as control point)
+/// - 4 = CURVE4 (cubic Bézier, consumes next 2 vertices as control points)
+/// - 79 = CLOSEPOLY
+///
+/// If `snap` is true, MOVETO and LINETO coordinates are rounded to the nearest
+/// integer (pixel-aligned rendering for Agg compatibility).
+pub fn raw_path_from_vertices_codes(
+    vertices_raw: &[u8],
+    codes_raw: &[u8],
+    count: usize,
+    snap: bool,
+) -> Option<tiny_skia::Path> {
+    if count == 0 {
+        return None;
+    }
+    let expected_verts = count.checked_mul(2)?.checked_mul(8)?;
+    if vertices_raw.len() != expected_verts || codes_raw.len() != count {
+        return None;
+    }
+
+    let mut pb = PathBuilder::new();
+    let mut i = 0usize;
+
+    while i < count {
+        let code = codes_raw[i];
+        let off = i * 16;
+        let x = f64::from_le_bytes([
+            vertices_raw[off],
+            vertices_raw[off + 1],
+            vertices_raw[off + 2],
+            vertices_raw[off + 3],
+            vertices_raw[off + 4],
+            vertices_raw[off + 5],
+            vertices_raw[off + 6],
+            vertices_raw[off + 7],
+        ]);
+        let y = f64::from_le_bytes([
+            vertices_raw[off + 8],
+            vertices_raw[off + 9],
+            vertices_raw[off + 10],
+            vertices_raw[off + 11],
+            vertices_raw[off + 12],
+            vertices_raw[off + 13],
+            vertices_raw[off + 14],
+            vertices_raw[off + 15],
+        ]);
+
+        match code {
+            1 => {
+                // MOVETO
+                let (fx, fy) = if snap {
+                    (x.round() as f32, y.round() as f32)
+                } else {
+                    (x as f32, y as f32)
+                };
+                if fx.is_finite() && fy.is_finite() {
+                    pb.move_to(fx, fy);
+                }
+                i += 1;
+            }
+            2 => {
+                // LINETO
+                let (fx, fy) = if snap {
+                    (x.round() as f32, y.round() as f32)
+                } else {
+                    (x as f32, y as f32)
+                };
+                if fx.is_finite() && fy.is_finite() {
+                    pb.line_to(fx, fy);
+                }
+                i += 1;
+            }
+            3 => {
+                // CURVE3 (quadratic): current vertex is control point,
+                // next vertex is endpoint
+                if i + 1 >= count {
+                    i += 1;
+                    continue;
+                }
+                let off2 = (i + 1) * 16;
+                let x2 = f64::from_le_bytes([
+                    vertices_raw[off2],
+                    vertices_raw[off2 + 1],
+                    vertices_raw[off2 + 2],
+                    vertices_raw[off2 + 3],
+                    vertices_raw[off2 + 4],
+                    vertices_raw[off2 + 5],
+                    vertices_raw[off2 + 6],
+                    vertices_raw[off2 + 7],
+                ]) as f32;
+                let y2 = f64::from_le_bytes([
+                    vertices_raw[off2 + 8],
+                    vertices_raw[off2 + 9],
+                    vertices_raw[off2 + 10],
+                    vertices_raw[off2 + 11],
+                    vertices_raw[off2 + 12],
+                    vertices_raw[off2 + 13],
+                    vertices_raw[off2 + 14],
+                    vertices_raw[off2 + 15],
+                ]) as f32;
+                let x1 = x as f32;
+                let y1 = y as f32;
+                if x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite() {
+                    pb.quad_to(x1, y1, x2, y2);
+                }
+                i += 2;
+            }
+            4 => {
+                // CURVE4 (cubic): current vertex is 1st control point,
+                // next vertex is 2nd control point, vertex after is endpoint
+                if i + 2 >= count {
+                    i += 1;
+                    continue;
+                }
+                let off2 = (i + 1) * 16;
+                let x2 = f64::from_le_bytes([
+                    vertices_raw[off2],
+                    vertices_raw[off2 + 1],
+                    vertices_raw[off2 + 2],
+                    vertices_raw[off2 + 3],
+                    vertices_raw[off2 + 4],
+                    vertices_raw[off2 + 5],
+                    vertices_raw[off2 + 6],
+                    vertices_raw[off2 + 7],
+                ]) as f32;
+                let y2 = f64::from_le_bytes([
+                    vertices_raw[off2 + 8],
+                    vertices_raw[off2 + 9],
+                    vertices_raw[off2 + 10],
+                    vertices_raw[off2 + 11],
+                    vertices_raw[off2 + 12],
+                    vertices_raw[off2 + 13],
+                    vertices_raw[off2 + 14],
+                    vertices_raw[off2 + 15],
+                ]) as f32;
+                let off3 = (i + 2) * 16;
+                let x3 = f64::from_le_bytes([
+                    vertices_raw[off3],
+                    vertices_raw[off3 + 1],
+                    vertices_raw[off3 + 2],
+                    vertices_raw[off3 + 3],
+                    vertices_raw[off3 + 4],
+                    vertices_raw[off3 + 5],
+                    vertices_raw[off3 + 6],
+                    vertices_raw[off3 + 7],
+                ]) as f32;
+                let y3 = f64::from_le_bytes([
+                    vertices_raw[off3 + 8],
+                    vertices_raw[off3 + 9],
+                    vertices_raw[off3 + 10],
+                    vertices_raw[off3 + 11],
+                    vertices_raw[off3 + 12],
+                    vertices_raw[off3 + 13],
+                    vertices_raw[off3 + 14],
+                    vertices_raw[off3 + 15],
+                ]) as f32;
+                let x1 = x as f32;
+                let y1 = y as f32;
+                if x1.is_finite() && y1.is_finite()
+                    && x2.is_finite() && y2.is_finite()
+                    && x3.is_finite() && y3.is_finite()
+                {
+                    pb.cubic_to(x1, y1, x2, y2, x3, y3);
+                }
+                i += 3;
+            }
+            79 => {
+                // CLOSEPOLY
+                pb.close();
+                i += 1;
+            }
+            _ => {
+                // Unknown code — skip
+                i += 1;
+            }
+        }
+    }
+
+    pb.finish()
+}
+
 /// Build a clip mask from a `ClipRect`.
 ///
 /// Returns `None` if the rect is degenerate or the mask cannot be allocated.

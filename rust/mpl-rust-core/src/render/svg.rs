@@ -615,6 +615,136 @@ fn render_svg_node(
             }
         }
 
+        SceneNode::PathData {
+            vertices_data,
+            vertices_blob,
+            vertices_dtype: _,
+            codes_data,
+            codes_blob,
+            count,
+            snap,
+            fill,
+            stroke,
+            transform,
+        } => {
+            if *count == 0 {
+                return;
+            }
+
+            // Resolve vertices
+            let verts_owned;
+            let verts_raw: &[u8] = if let Some(blob_idx) = vertices_blob {
+                match blobs.and_then(|all| all.get(*blob_idx)) {
+                    Some(b) => b,
+                    None => return,
+                }
+            } else if let Some(b64) = vertices_data.as_ref() {
+                verts_owned = match base64_decode(b64) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                &verts_owned
+            } else {
+                return;
+            };
+
+            // Resolve codes
+            let codes_owned;
+            let codes_raw: &[u8] = if let Some(blob_idx) = codes_blob {
+                match blobs.and_then(|all| all.get(*blob_idx)) {
+                    Some(b) => b,
+                    None => return,
+                }
+            } else if let Some(b64) = codes_data.as_ref() {
+                codes_owned = match base64_decode(b64) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                &codes_owned
+            } else {
+                return;
+            };
+
+            let d = raw_vertices_codes_to_svg_path(verts_raw, codes_raw, *count, *snap);
+            if d.is_empty() {
+                return;
+            }
+
+            write!(svg, r#"{pad}<path d="{d}""#).unwrap();
+            if !is_identity_transform(transform) {
+                write!(
+                    svg,
+                    r#" transform="matrix({},{},{},{},{},{})""#,
+                    transform[0], transform[1], transform[2],
+                    transform[3], transform[4], transform[5],
+                )
+                .unwrap();
+            }
+            if let Some(fill_style) = fill {
+                write!(svg, r#" fill="{}""#, rgba_to_svg_color(&fill_style.color)).unwrap();
+                if fill_style.color[3] < 1.0 {
+                    write!(svg, r#" fill-opacity="{:.3}""#, fill_style.color[3]).unwrap();
+                }
+            } else {
+                svg.push_str(r#" fill="none""#);
+            }
+            if let Some(stroke_style) = stroke {
+                write_stroke_attrs(svg, stroke_style);
+            }
+            svg.push_str("/>\n");
+        }
+
+        SceneNode::ImageBlob {
+            data_blob,
+            x,
+            y,
+            width,
+            height,
+            transform,
+        } => {
+            if *width <= 0.0 || *height <= 0.0 || !width.is_finite() || !height.is_finite() {
+                return;
+            }
+            let raw = match blobs.and_then(|all| all.get(*data_blob)) {
+                Some(b) => b,
+                None => return,
+            };
+            let img_w = *width as u32;
+            let img_h = *height as u32;
+            let expected = match (img_w as usize).checked_mul(img_h as usize).and_then(|n| n.checked_mul(4)) {
+                Some(n) => n,
+                None => return,
+            };
+            if raw.len() != expected {
+                return;
+            }
+            // Premultiply and encode to PNG for SVG embedding
+            let mut premul = raw.to_vec();
+            for pixel in premul.chunks_exact_mut(4) {
+                let a = pixel[3] as f32 / 255.0;
+                pixel[0] = (pixel[0] as f32 * a + 0.5) as u8;
+                pixel[1] = (pixel[1] as f32 * a + 0.5) as u8;
+                pixel[2] = (pixel[2] as f32 * a + 0.5) as u8;
+            }
+            let Some(size) = tiny_skia::IntSize::from_wh(img_w, img_h) else {
+                return;
+            };
+            if let Some(pm) = Pixmap::from_vec(premul, size) {
+                if let Ok(png_data) = pm.encode_png() {
+                    let b64 = base64_encode(&png_data);
+                    write!(
+                        svg,
+                        r#"{pad}<image x="{x}" y="{y}" width="{w}" height="{h}" preserveAspectRatio="none" href="data:image/png;base64,{data}""#,
+                        x = x, y = y, w = width, h = height, data = b64,
+                    ).unwrap();
+                    if !is_identity_transform(transform) {
+                        write_svg_transform_attr(svg, transform);
+                    }
+                    svg.push_str("/>\n");
+                }
+            }
+        }
+
         SceneNode::Image {
             data,
             x,
@@ -789,6 +919,105 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
                 d.push_str("Z ");
             }
             _ => {}
+        }
+    }
+    d.trim_end().to_string()
+}
+
+/// Convert raw vertices/codes blobs to SVG path data string.
+fn raw_vertices_codes_to_svg_path(
+    vertices_raw: &[u8],
+    codes_raw: &[u8],
+    count: usize,
+    snap: bool,
+) -> String {
+    if count == 0 {
+        return String::new();
+    }
+    let expected_verts = match count.checked_mul(16) {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    if vertices_raw.len() != expected_verts || codes_raw.len() != count {
+        return String::new();
+    }
+
+    let mut d = String::with_capacity(count * 20);
+    let mut i = 0usize;
+
+    while i < count {
+        let code = codes_raw[i];
+        let off = i * 16;
+        let x = f64::from_le_bytes([
+            vertices_raw[off], vertices_raw[off+1], vertices_raw[off+2], vertices_raw[off+3],
+            vertices_raw[off+4], vertices_raw[off+5], vertices_raw[off+6], vertices_raw[off+7],
+        ]);
+        let y = f64::from_le_bytes([
+            vertices_raw[off+8], vertices_raw[off+9], vertices_raw[off+10], vertices_raw[off+11],
+            vertices_raw[off+12], vertices_raw[off+13], vertices_raw[off+14], vertices_raw[off+15],
+        ]);
+
+        match code {
+            1 => {
+                let (fx, fy) = if snap { (x.round(), y.round()) } else { (x, y) };
+                if fx.is_finite() && fy.is_finite() {
+                    write!(d, "M{:.2},{:.2} ", fx, fy).unwrap();
+                }
+                i += 1;
+            }
+            2 => {
+                let (fx, fy) = if snap { (x.round(), y.round()) } else { (x, y) };
+                if fx.is_finite() && fy.is_finite() {
+                    write!(d, "L{:.2},{:.2} ", fx, fy).unwrap();
+                }
+                i += 1;
+            }
+            3 => {
+                if i + 1 >= count { i += 1; continue; }
+                let off2 = (i + 1) * 16;
+                let x2 = f64::from_le_bytes([
+                    vertices_raw[off2], vertices_raw[off2+1], vertices_raw[off2+2], vertices_raw[off2+3],
+                    vertices_raw[off2+4], vertices_raw[off2+5], vertices_raw[off2+6], vertices_raw[off2+7],
+                ]);
+                let y2 = f64::from_le_bytes([
+                    vertices_raw[off2+8], vertices_raw[off2+9], vertices_raw[off2+10], vertices_raw[off2+11],
+                    vertices_raw[off2+12], vertices_raw[off2+13], vertices_raw[off2+14], vertices_raw[off2+15],
+                ]);
+                if x.is_finite() && y.is_finite() && x2.is_finite() && y2.is_finite() {
+                    write!(d, "Q{:.2},{:.2} {:.2},{:.2} ", x, y, x2, y2).unwrap();
+                }
+                i += 2;
+            }
+            4 => {
+                if i + 2 >= count { i += 1; continue; }
+                let off2 = (i + 1) * 16;
+                let x2 = f64::from_le_bytes([
+                    vertices_raw[off2], vertices_raw[off2+1], vertices_raw[off2+2], vertices_raw[off2+3],
+                    vertices_raw[off2+4], vertices_raw[off2+5], vertices_raw[off2+6], vertices_raw[off2+7],
+                ]);
+                let y2 = f64::from_le_bytes([
+                    vertices_raw[off2+8], vertices_raw[off2+9], vertices_raw[off2+10], vertices_raw[off2+11],
+                    vertices_raw[off2+12], vertices_raw[off2+13], vertices_raw[off2+14], vertices_raw[off2+15],
+                ]);
+                let off3 = (i + 2) * 16;
+                let x3 = f64::from_le_bytes([
+                    vertices_raw[off3], vertices_raw[off3+1], vertices_raw[off3+2], vertices_raw[off3+3],
+                    vertices_raw[off3+4], vertices_raw[off3+5], vertices_raw[off3+6], vertices_raw[off3+7],
+                ]);
+                let y3 = f64::from_le_bytes([
+                    vertices_raw[off3+8], vertices_raw[off3+9], vertices_raw[off3+10], vertices_raw[off3+11],
+                    vertices_raw[off3+12], vertices_raw[off3+13], vertices_raw[off3+14], vertices_raw[off3+15],
+                ]);
+                if x.is_finite() && y.is_finite() && x2.is_finite() && y2.is_finite() && x3.is_finite() && y3.is_finite() {
+                    write!(d, "C{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} ", x, y, x2, y2, x3, y3).unwrap();
+                }
+                i += 3;
+            }
+            79 => {
+                d.push_str("Z ");
+                i += 1;
+            }
+            _ => { i += 1; }
         }
     }
     d.trim_end().to_string()

@@ -172,6 +172,52 @@ class SceneBuilder:
             node["positions_transform"] = positions_transform
         self._nodes.append(node)
 
+    def add_path_data(
+        self,
+        vertices_bytes,
+        codes_bytes,
+        count,
+        snap=False,
+        fill=None,
+        stroke=None,
+        transform=None,
+    ):
+        """Add a path using binary vertex/code blobs (zero-copy transport)."""
+        vblob = len(self._blobs)
+        self._blobs.append(vertices_bytes)
+        cblob = len(self._blobs)
+        self._blobs.append(codes_bytes)
+        node = {
+            "type": "path_data",
+            "vertices_blob": vblob,
+            "vertices_dtype": "f64",
+            "codes_blob": cblob,
+            "count": count,
+            "snap": snap,
+            "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+        }
+        if fill is not None:
+            node["fill"] = fill
+        if stroke is not None:
+            node["stroke"] = stroke
+        self._nodes.append(node)
+
+    def add_image_blob(self, raw_bytes, x, y, width, height, transform=None):
+        """Add an image using raw RGBA blob (skip base64 encoding)."""
+        blob_idx = len(self._blobs)
+        self._blobs.append(raw_bytes)
+        self._nodes.append(
+            {
+                "type": "image_blob",
+                "data_blob": blob_idx,
+                "x": x,
+                "y": y,
+                "width": width,
+                "height": height,
+                "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            }
+        )
+
     def add_image(self, data_b64, x, y, width, height, transform=None):
         self._nodes.append(
             {

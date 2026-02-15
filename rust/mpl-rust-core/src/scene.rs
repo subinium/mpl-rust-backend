@@ -133,6 +133,38 @@ pub enum SceneNode {
         #[serde(default = "default_transform")]
         transform: [f64; 6],
     },
+    #[serde(rename = "path_data")]
+    PathData {
+        #[serde(default)]
+        vertices_data: Option<String>,
+        #[serde(default)]
+        vertices_blob: Option<usize>,
+        #[serde(default = "default_point_dtype")]
+        vertices_dtype: String,
+        #[serde(default)]
+        codes_data: Option<String>,
+        #[serde(default)]
+        codes_blob: Option<usize>,
+        count: usize,
+        #[serde(default)]
+        snap: bool,
+        #[serde(default)]
+        fill: Option<FillStyle>,
+        #[serde(default)]
+        stroke: Option<StrokeStyle>,
+        #[serde(default = "default_transform")]
+        transform: [f64; 6],
+    },
+    #[serde(rename = "image_blob")]
+    ImageBlob {
+        data_blob: usize,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        #[serde(default = "default_transform")]
+        transform: [f64; 6],
+    },
     #[serde(rename = "image")]
     Image {
         data: String, // base64 encoded RGBA bytes

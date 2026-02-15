@@ -90,17 +90,35 @@ class RendererRust(RendererBase):
     def draw_path(self, gc, path, transform, rgbFace=None):
         self._apply_clip(gc)
         combined = transform + self._y_flip()
-        # Snap rectilinear thin-stroke paths to pixel centers (matches Agg).
-        # Agg rounds coordinates to nearest integer for rectilinear paths with
-        # linewidth <= ~1px.  Combined with the +0.5 stroke offset in Rust,
-        # this places strokes exactly at pixel centers.
         snap = self._should_snap(gc, path, combined)
-        segments = path_to_segments(path, combined, snap=snap)
-        if not segments:
-            return
         fill = gc_to_fill(gc, rgbFace)
         stroke = gc_to_stroke(gc, self)
-        self._scene.add_path(segments, fill=fill, stroke=stroke)
+
+        # For large paths, use binary transport to skip Python loop overhead
+        n_vertices = path.vertices.shape[0] if path.vertices is not None else 0
+        if n_vertices > 50:
+            path_t = path.transformed(combined)
+            verts = np.ascontiguousarray(path_t.vertices, dtype=np.float64)
+            codes = path_t.codes
+            if codes is None:
+                # Default: MOVETO for first, LINETO for rest
+                codes = np.full(len(verts), 2, dtype=np.uint8)
+                codes[0] = 1
+            else:
+                codes = np.ascontiguousarray(codes, dtype=np.uint8)
+            self._scene.add_path_data(
+                verts.tobytes(),
+                codes.tobytes(),
+                len(verts),
+                snap=snap,
+                fill=fill,
+                stroke=stroke,
+            )
+        else:
+            segments = path_to_segments(path, combined, snap=snap)
+            if not segments:
+                return
+            self._scene.add_path(segments, fill=fill, stroke=stroke)
 
     def _should_snap(self, gc, path, combined_transform):
         """Check if the path should be snapped to pixel centers (Agg compat).
@@ -175,15 +193,15 @@ class RendererRust(RendererBase):
         im_flipped = im[::-1]
         h, w = im_flipped.shape[:2]
         raw = np.ascontiguousarray(im_flipped).tobytes()
-        data_b64 = base64.b64encode(raw).decode("ascii")
 
         # Convert (x, y_bottom_yup) to (x, y_top_ydown).
         # Round to integer pixels to match Agg's integer placement.
         x_px = round(x)
         y_px = round(self.height - y - h)
 
-        self._scene.add_image(
-            data_b64=data_b64,
+        # Use blob transport (skip base64 encode/decode overhead)
+        self._scene.add_image_blob(
+            raw_bytes=raw,
             x=float(x_px),
             y=float(y_px),
             width=float(w),

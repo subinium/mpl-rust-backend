@@ -5,7 +5,7 @@ use png::{BitDepth, ColorType, Compression, FilterType};
 use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, Pixmap, Stroke, Transform};
 
 use crate::color::Colormap;
-use crate::geometry::{affine_to_transform, build_clip_mask, segments_to_path};
+use crate::geometry::{affine_to_transform, build_clip_mask, raw_path_from_vertices_codes, segments_to_path};
 use crate::scene::{FillStyle, Scene, SceneNode, StrokeStyle};
 use crate::text;
 
@@ -279,6 +279,134 @@ fn render_node(
                     let stroke_transform = combined.pre_concat(Transform::from_translate(0.5, 0.5));
                     pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, None);
                 }
+            }
+        }
+
+        SceneNode::PathData {
+            vertices_data,
+            vertices_blob,
+            vertices_dtype: _,
+            codes_data,
+            codes_blob,
+            count,
+            snap,
+            fill,
+            stroke,
+            transform,
+        } => {
+            let local = affine_to_transform(transform);
+            let combined = parent_transform.pre_concat(local);
+
+            if *count == 0 {
+                return;
+            }
+
+            // Resolve vertices blob or base64 fallback
+            let verts_owned;
+            let verts_raw: &[u8] = if let Some(blob_idx) = vertices_blob {
+                match blobs.and_then(|all| all.get(*blob_idx)) {
+                    Some(b) => b,
+                    None => return,
+                }
+            } else if let Some(b64) = vertices_data.as_ref() {
+                verts_owned = match base64_decode(b64) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                &verts_owned
+            } else {
+                return;
+            };
+
+            // Resolve codes blob or base64 fallback
+            let codes_owned;
+            let codes_raw: &[u8] = if let Some(blob_idx) = codes_blob {
+                match blobs.and_then(|all| all.get(*blob_idx)) {
+                    Some(b) => b,
+                    None => return,
+                }
+            } else if let Some(b64) = codes_data.as_ref() {
+                codes_owned = match base64_decode(b64) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                &codes_owned
+            } else {
+                return;
+            };
+
+            if let Some(path) = raw_path_from_vertices_codes(verts_raw, codes_raw, *count, *snap) {
+                if let Some(fill_style) = fill {
+                    let paint = make_fill_paint(&fill_style.color, parent_alpha);
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, combined, None);
+                }
+                if let Some(stroke_style) = stroke {
+                    let paint = make_fill_paint(&stroke_style.color, parent_alpha);
+                    let sk_stroke = make_stroke(stroke_style, parent_transform);
+                    let stroke_transform = combined.pre_concat(Transform::from_translate(0.5, 0.5));
+                    pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, None);
+                }
+            }
+        }
+
+        SceneNode::ImageBlob {
+            data_blob,
+            x,
+            y,
+            width,
+            height,
+            transform,
+        } => {
+            let local = affine_to_transform(transform);
+            let combined = parent_transform.pre_concat(local);
+
+            if *width <= 0.0 || *height <= 0.0 || !width.is_finite() || !height.is_finite() {
+                return;
+            }
+
+            let raw = match blobs.and_then(|all| all.get(*data_blob)) {
+                Some(b) => b,
+                None => return,
+            };
+
+            let img_w = *width as u32;
+            let img_h = *height as u32;
+            let expected_len = match (img_w as usize).checked_mul(img_h as usize).and_then(|n| n.checked_mul(4)) {
+                Some(n) => n,
+                None => return,
+            };
+
+            if raw.len() != expected_len {
+                return;
+            }
+
+            // Premultiply RGBA
+            let mut premul = raw.to_vec();
+            for pixel in premul.chunks_exact_mut(4) {
+                let a = pixel[3] as f32 / 255.0;
+                pixel[0] = (pixel[0] as f32 * a + 0.5) as u8;
+                pixel[1] = (pixel[1] as f32 * a + 0.5) as u8;
+                pixel[2] = (pixel[2] as f32 * a + 0.5) as u8;
+            }
+
+            let Some(size) = tiny_skia::IntSize::from_wh(img_w, img_h) else {
+                return;
+            };
+            if let Some(img_pixmap) = Pixmap::from_vec(premul, size) {
+                let img_transform =
+                    combined.pre_concat(Transform::from_translate(*x as f32, *y as f32));
+                pixmap.draw_pixmap(
+                    0,
+                    0,
+                    img_pixmap.as_ref(),
+                    &tiny_skia::PixmapPaint {
+                        opacity: parent_alpha as f32,
+                        blend_mode: tiny_skia::BlendMode::SourceOver,
+                        quality: tiny_skia::FilterQuality::Nearest,
+                    },
+                    img_transform,
+                    None,
+                );
             }
         }
 
