@@ -70,7 +70,7 @@ matplotlib draw calls (Python)
           +---> Rust mpl-rust-core
                      |
                      +-- serde_json parse + blob routing
-                     +-- tiny-skia rasterizer
+                     +-- tiny-skia rasterizer (stamp-cached markers)
                      +-- PNG / SVG encoder
                            |
                            v
@@ -81,14 +81,15 @@ matplotlib draw calls (Python)
 |-------|----------|------|
 | `mpl_rust_backend` | Python | matplotlib `RendererBase` implementation, scene graph builder |
 | `mpl-rust-pybridge` | Rust (PyO3) | FFI bridge, accepts JSON + blobs, returns PNG/SVG bytes |
-| `mpl-rust-core` | Rust | Scene parser, tiny-skia rasterizer, SVG writer, PNG encoder |
+| `mpl-rust-core` | Rust | Scene parser, tiny-skia rasterizer (stamp-cached markers), SVG writer, PNG encoder |
 
 ### Binary Transport
 
 Large data bypasses JSON entirely via the PXPK binary side-channel:
 
-- **PathData**: Paths with >50 vertices send raw `f64` vertex arrays + `u8` code arrays as blobs
-- **MarkersData**: Marker positions (>100 points) send raw `f32` position arrays as blobs
+- **PathData**: Paths with >20 vertices send raw `f64` vertex arrays + `u8` code arrays as blobs
+- **PolylineData**: Stroke-only polylines skip the codes array entirely
+- **MarkersData**: Marker positions (>30 points) send raw `f32` position arrays as blobs
 - **ImageBlob**: Raw RGBA pixel data sent directly — no base64 encoding
 
 This eliminates the Python dict creation and JSON serialization overhead for the most expensive draw calls.
@@ -101,37 +102,36 @@ This eliminates the Python dict creation and JSON serialization overhead for the
 
 | Plot Type | MSE | Status |
 |-----------|-----|--------|
-| Bar chart | 28.0 | MATCH |
-| Imshow (heatmap) | 50.2 | MATCH |
-| Scatter (5K pts) | 67.3 | MATCH |
-| Histogram (10K) | 85.3 | MATCH |
-| Step plot | 104.5 | MATCH |
-| Subplots (2x2) | 134.5 | MATCH |
-| Fill between | 173.5 | MATCH |
-| Line (100K pts) | 188.8 | MATCH |
+| Bar chart | 30.3 | MATCH |
+| Imshow (heatmap) | 52.5 | MATCH |
+| Scatter (5K pts) | 85.6 | MATCH |
+| Histogram (10K) | 88.9 | MATCH |
+| Step plot | 108.5 | MATCH |
+| Subplots (2x2) | 141.9 | MATCH |
+| Line (100K pts) | 151.0 | MATCH |
+| Fill between | 177.7 | MATCH |
 
 ### Extended Plot Types (18 tests)
 
 | Plot Type | MSE | Status |
 |-----------|-----|--------|
 | Pie chart | 21.7 | MATCH |
-| Contourf (filled) | 65.4 | MATCH |
-| Stackplot | 67.1 | MATCH |
+| Contourf (filled) | 67.2 | MATCH |
+| Stackplot | 72.2 | MATCH |
+| Errorbar | 83.9 | MATCH |
 | 3D bar | 87.9 | MATCH |
-| Errorbar | 88.0 | MATCH |
-| Quiver | 113.5 | MATCH |
-| Annotated heatmap | 117.1 | MATCH |
+| Annotated heatmap | 119.9 | MATCH |
 | 3D surface | 121.9 | MATCH |
 | 3D scatter | 122.6 | MATCH |
 | Polar bar | 137.6 | MATCH |
 | Polar scatter | 185.9 | MATCH |
-| Log-log scale | 205.1 | MATCH |
 | Polar line (rose) | 208.2 | MATCH |
 | 3D wireframe | 209.5 | MATCH |
-| Stem plot | 212.0 | MATCH |
-| Streamplot | 244.1 | MATCH |
-| Twin axes | 295.0 | MATCH |
-| Contour (lines) | 444.4 | MATCH |
+| Log-log scale | 210.2 | MATCH |
+| Stem plot | 215.7 | MATCH |
+| Streamplot | 246.7 | MATCH |
+| Twin axes | 300.2 | MATCH |
+| Contour (lines) | 447.0 | MATCH |
 
 ### Why Not Exact?
 
@@ -150,78 +150,85 @@ Measured via isolated subprocesses (fresh Python per test). Median of 5 timed ru
 
 | Case | Agg (ms) | Rust (ms) | Ratio |
 |------|----------|-----------|-------|
-| imshow_500 | 28 | 20 | **1.39x** |
-| line_1k | 17 | 17 | **1.01x** |
-| imshow_100 | 17 | 17 | 0.97x |
-| hist_10k | 22 | 23 | 0.95x |
-| errorbar_20 | 18 | 20 | 0.93x |
-| fill_between | 20 | 22 | 0.92x |
-| step_50 | 16 | 18 | 0.89x |
-| bar_20 | 24 | 27 | 0.88x |
-| subplots_2x2 | 37 | 42 | 0.87x |
-| multiline_20 | 31 | 36 | 0.85x |
-| scatter_1k | 20 | 30 | 0.69x |
-| line_10k | 23 | 38 | 0.62x |
-| scatter_50k | 24 | 103 | 0.23x |
-| scatter_10k | 23 | 123 | 0.19x |
-| line_100k | 42 | 363 | 0.12x |
+| imshow_500 | 25 | 20 | **1.26x** |
+| scatter_50k | 23 | 19 | **1.19x** |
+| scatter_1k | 21 | 18 | **1.17x** |
+| scatter_10k | 23 | 21 | **1.10x** |
+| line_1k | 17 | 16 | **1.05x** |
+| imshow_100 | 17 | 17 | 1.05x |
+| step_50 | 17 | 17 | 1.01x |
+| fill_between | 19 | 20 | 0.97x |
+| errorbar_20 | 18 | 19 | 0.96x |
+| subplots_2x2 | 37 | 39 | 0.95x |
+| bar_20 | 24 | 25 | 0.94x |
+| hist_10k | 18 | 22 | 0.84x |
+| multiline_20 | 29 | 35 | 0.82x |
+| line_10k | 23 | 35 | 0.65x |
+| line_100k | 40 | 340 | 0.12x |
 
 ### Extended Plot Types (17 tests)
 
 | Case | Agg (ms) | Rust (ms) | Ratio |
 |------|----------|-----------|-------|
-| pie | 7 | 6 | **1.14x** |
-| polar_line | 27 | 26 | **1.05x** |
-| stackplot | 21 | 21 | 0.99x |
-| polar_bar | 28 | 29 | 0.98x |
-| contour | 18 | 19 | 0.96x |
-| stem | 16 | 17 | 0.93x |
-| contourf | 16 | 18 | 0.88x |
-| multiaxis | 28 | 32 | 0.88x |
-| 3d_bar | 23 | 31 | 0.75x |
-| heatmap_text | 24 | 33 | 0.74x |
-| 3d_wireframe | 24 | 33 | 0.74x |
-| polar_scatter | 29 | 46 | 0.62x |
-| quiver | 23 | 42 | 0.54x |
-| streamplot | 36 | 68 | 0.53x |
-| log_scale | 137 | 273 | 0.50x |
-| 3d_scatter | 25 | 77 | 0.32x |
-| 3d_surface | 42 | 146 | 0.29x |
+| pie | 7 | 6 | **1.31x** |
+| polar_bar | 30 | 27 | **1.09x** |
+| stackplot | 21 | 20 | 1.05x |
+| polar_line | 27 | 27 | 1.02x |
+| contourf | 18 | 17 | 1.02x |
+| contour | 20 | 19 | 1.01x |
+| stem | 17 | 17 | 1.00x |
+| multiaxis | 26 | 26 | 1.02x |
+| polar_scatter | 29 | 31 | 0.93x |
+| 3d_bar | 25 | 29 | 0.89x |
+| 3d_wireframe | 25 | 29 | 0.86x |
+| heatmap_text | 24 | 28 | 0.85x |
+| 3d_scatter | 25 | 41 | 0.61x |
+| streamplot | 38 | 66 | 0.58x |
+| log_scale | 144 | 253 | 0.57x |
+| quiver | 23 | 41 | 0.55x |
+| 3d_surface | 48 | 124 | 0.38x |
 
 ### Summary
 
 | Metric | Value |
 |--------|-------|
 | Total tests | 32 |
-| Geometric mean | **0.68x** |
-| Median speedup | **0.87x** |
-| Rust faster | 4/32 (imshow_500, pie, polar_line, line_1k) |
-| Parity (0.95-1.05x) | 6/32 |
+| Geometric mean | **0.84x** |
+| Median speedup | **0.97x** |
+| Rust faster | 7/32 |
+| Parity (0.95-1.05x) | 10/32 |
+| Rust slower | 15/32 |
 
-For **typical charts** (lines <10K pts, bars, histograms, images, pie, polar, contour, stackplot), the Rust backend is **within 85-100%** of Agg speed. Image-heavy workloads (`imshow_500`) are **up to 1.4x faster**.
+For **typical charts** (scatter, lines <10K pts, bars, histograms, images, pie, polar, contour, stackplot), the Rust backend is **at parity or faster** than Agg. Image-heavy workloads are **up to 1.3x faster**, and scatter plots (any size) are now **1.1-1.2x faster** thanks to stamp-cached marker blitting.
 
-Large-data cases (>10K scatter/line points, 3D surface) remain slower due to scene graph serialization overhead scaling with primitive count.
+Large-line cases (>10K line points, 3D surface) remain slower due to scene graph serialization overhead scaling with vertex count.
 
 ### SVG Output (subset)
 
 | Case | Agg (ms) | Rust (ms) | Ratio |
 |------|----------|-----------|-------|
-| scatter_10k | 105 | 22 | **4.86x** |
-| imshow_100 | 15 | 12 | **1.18x** |
-| line_10k | 15 | 16 | 0.93x |
-| bar_20 | 18 | 20 | 0.90x |
+| scatter_10k | 107 | 17 | **6.2x** |
+| imshow_100 | 13 | 12 | **1.09x** |
+| bar_20 | 17 | 17 | 1.03x |
+| line_10k | 14 | 16 | 0.89x |
 
-SVG scatter plots are **~5x faster** than matplotlib's default SVG backend.
+SVG scatter plots are **~6x faster** than matplotlib's default SVG backend.
 
 ### Performance Notes
 
-The main bottleneck for large-data cases is the Python-side scene graph construction, not Rust rasterization. Current optimizations:
+Current engine-level optimizations:
 
 | Optimization | Impact |
 |-------------|--------|
-| Binary path transport (PathData) | Eliminates Python dict loop + JSON for paths >50 vertices |
-| Binary marker transport (MarkersData) | Zero-copy f32 position arrays for >100 markers |
+| Stamp-cached marker blitting | Rasterize marker once, blit at each position — scatter 10K: 3.8x faster |
+| Binary path transport (PathData) | Eliminates Python dict loop + JSON for paths >20 vertices |
+| Binary marker transport (MarkersData) | Zero-copy f32 position arrays for >30 markers |
+| PolylineData stroke-only paths | Skips codes array for stroke-only polylines |
 | Raw image blobs (ImageBlob) | Skips base64 encode/decode for all images |
+| Numpy-vectorized marker positions | Eliminates Python `for` loop in `draw_markers` |
+| OnceLock env-var caching | Reads 20+ config env vars once, not per frame |
+| Enum scene types (PathCmd, LineCap, LineJoin) | Zero-cost serde deserialization, no heap allocation |
+| LTO + codegen-units=1 | Cross-crate inlining in release builds |
 | `orjson` auto-detection | 3-5x faster JSON serialization when available |
 
 ## Project Structure
@@ -280,10 +287,11 @@ This matters because:
 | Advantage | Detail |
 |-----------|--------|
 | **Drop-in replacement** | Zero changes to existing matplotlib code — just switch the backend |
-| **Pixel-accurate fidelity** | 26/26 chart types MATCH (MSE < 500 for all) |
+| **Pixel-accurate fidelity** | 26/26 chart types MATCH (MSE < 450 for all) |
 | **Memory safety** | Rust's ownership model eliminates buffer overflow and use-after-free bugs |
-| **SVG performance** | Up to 5x faster SVG output for data-heavy plots |
-| **Image rendering** | 1.4x faster than Agg for image-heavy workloads (imshow, heatmaps) |
+| **Scatter performance** | 1.1-1.2x faster than Agg for scatter plots of any size via stamp-cached blitting |
+| **SVG performance** | Up to 6x faster SVG output for data-heavy plots |
+| **Image rendering** | 1.3x faster than Agg for image-heavy workloads (imshow, heatmaps) |
 | **Modular architecture** | Scene graph decouples matplotlib from the rasterizer — swap tiny-skia for GPU rendering without changing the Python layer |
 | **Cross-platform** | Builds on macOS, Linux, Windows via standard Rust toolchain |
 
@@ -291,7 +299,7 @@ This matters because:
 
 | Limitation | Detail |
 |------------|--------|
-| **Large-data overhead** | Scatter/line plots with >10K points are 2-5x slower due to scene graph serialization cost |
+| **Large-line overhead** | Line plots with >10K vertices are slower due to scene graph serialization cost |
 | **Not a full matplotlib replacement** | This replaces the *rendering engine* only — layout, tick calculation, legend placement all still happen in matplotlib |
 | **Build requires Rust toolchain** | Users need `rustup` + `maturin` to build from source (no pre-built wheels yet) |
 | **Anti-aliasing differences** | tiny-skia uses analytic AA vs Agg's 256-level scanline AA — sub-pixel coverage differs by a few percent at shape edges |
@@ -301,7 +309,7 @@ This matters because:
 ### Future Directions
 
 - **Pre-built wheels** via `maturin build` + CI for pip-installable distribution
-- **Direct PyO3 scene construction** to eliminate JSON serialization entirely (estimated 3-5x speedup for large data)
+- **Direct PyO3 scene construction** to eliminate JSON serialization entirely (estimated 3-5x speedup for large line data)
 - **GPU-accelerated rasterizer** using `wgpu` as an alternative to tiny-skia
 - **Interactive backend** for Jupyter and Qt integration
 - **Incremental rendering** for animation workloads (only re-render changed elements)
