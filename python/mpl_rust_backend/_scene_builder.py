@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import struct
+
+try:
+    import orjson as _json_mod
+
+    def _dumps(obj: dict) -> bytes:
+        return _json_mod.dumps(obj)
+
+except ImportError:
+    import json as _json_mod
+
+    def _dumps(obj: dict) -> bytes:
+        return _json_mod.dumps(obj, separators=(",", ":")).encode("utf-8")
 
 
 class SceneBuilder:
@@ -187,7 +198,7 @@ class SceneBuilder:
             "background": [1.0, 1.0, 1.0, 1.0],
             "nodes": self._nodes,
         }
-        json_bytes = json.dumps(scene, separators=(",", ":")).encode("utf-8")
+        json_bytes = _dumps(scene)
         return json_bytes, list(self._blobs)
 
     def build_packet(self) -> bytes:
