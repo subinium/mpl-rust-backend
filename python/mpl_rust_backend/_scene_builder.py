@@ -197,7 +197,7 @@ class SceneBuilder:
         node = {
             "type": "path_data",
             "vertices_blob": vblob,
-            "vertices_dtype": "f64",
+            "vertices_dtype": "f32",
             "codes_blob": cblob,
             "count": count,
             "snap": snap,
@@ -245,6 +245,40 @@ class SceneBuilder:
                 "transform": transform or _IDENTITY,
             }
         )
+
+    def add_polygons_data(
+        self,
+        points_bytes,
+        point_count,
+        ring_sizes_bytes,
+        polygon_count,
+        fill_colors_bytes,
+        stroke=None,
+        transform=None,
+    ):
+        """Add batched polygons using binary blobs (zero-copy transport)."""
+        pts_blob = len(self._blobs)
+        self._blobs.append(points_bytes)
+        rings_blob = len(self._blobs)
+        self._blobs.append(ring_sizes_bytes)
+        colors_blob = len(self._blobs)
+        self._blobs.append(fill_colors_bytes)
+
+        node = {
+            "type": "polygons_data",
+            "points_blob": pts_blob,
+            "points_dtype": "f32",
+            "point_count": point_count,
+            "ring_sizes_blob": rings_blob,
+            "ring_sizes_dtype": "u32",
+            "polygon_count": polygon_count,
+            "fill_colors_blob": colors_blob,
+            "fill_colors_dtype": "f32",
+            "transform": transform or _IDENTITY,
+        }
+        if stroke is not None:
+            node["stroke"] = stroke
+        self._nodes.append(node)
 
     def build(self) -> tuple[bytes, list[bytes]]:
         """Serialize the scene graph to JSON bytes + blob list."""

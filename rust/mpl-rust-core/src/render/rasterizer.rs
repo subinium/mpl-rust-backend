@@ -512,7 +512,7 @@ fn render_node(
         SceneNode::PathData {
             vertices_data,
             vertices_blob,
-            vertices_dtype: _,
+            vertices_dtype,
             codes_data,
             codes_blob,
             count,
@@ -562,7 +562,7 @@ fn render_node(
                 return;
             };
 
-            if let Some(path) = raw_path_from_vertices_codes(verts_raw, codes_raw, *count, *snap) {
+            if let Some(path) = raw_path_from_vertices_codes(verts_raw, codes_raw, *count, *snap, vertices_dtype) {
                 if let Some(fill_style) = fill {
                     let paint = make_fill_paint(&fill_style.color, parent_alpha);
                     pixmap.fill_path(&path, &paint, FillRule::Winding, combined, None);

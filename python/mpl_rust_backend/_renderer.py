@@ -93,11 +93,57 @@ class RendererRust(RendererBase):
         fill = gc_to_fill(gc, rgbFace)
         stroke = gc_to_stroke(gc, self)
 
-        # For large paths, use binary transport to skip Python loop overhead
         n_vertices = path.vertices.shape[0] if path.vertices is not None else 0
+
+        # Path simplification: for large simplifiable paths, use matplotlib's
+        # C-extension to reduce vertex count before binary transport.
+        if n_vertices > 128 and path.should_simplify:
+            cleaned = path.cleaned(
+                transform=combined,
+                simplify=True,
+                curves=True,
+                remove_nans=True,
+            )
+            c_verts = cleaned.vertices
+            c_codes = cleaned.codes
+            n_clean = len(c_verts)
+            if n_clean < 2:
+                return
+            # Strip trailing STOP code (code 0) from cleaned path
+            if c_codes is not None and n_clean > 0 and c_codes[-1] == 0:
+                c_verts = c_verts[:-1]
+                c_codes = c_codes[:-1]
+                n_clean -= 1
+                if n_clean < 2:
+                    return
+            # For stroke-only polylines, use PolylineData (no codes needed)
+            if fill is None and stroke is not None and c_codes is not None:
+                unique = set(c_codes.ravel())
+                if unique <= {1, 2}:  # only MOVETO + LINETO
+                    pts = np.ascontiguousarray(c_verts, dtype=np.float32)
+                    self._scene.add_polyline_data(
+                        pts.tobytes(),
+                        n_clean,
+                        stroke=stroke,
+                    )
+                    return
+            snap = self._should_snap_fast(gc, c_codes)
+            verts = np.ascontiguousarray(c_verts, dtype=np.float32)
+            codes = np.ascontiguousarray(c_codes, dtype=np.uint8)
+            self._scene.add_path_data(
+                verts.tobytes(),
+                codes.tobytes(),
+                n_clean,
+                snap=snap,
+                fill=fill,
+                stroke=stroke,
+            )
+            return
+
+        # For large paths, use binary transport to skip Python loop overhead
         if n_vertices > 20:
             path_t = path.transformed(combined)
-            verts = np.ascontiguousarray(path_t.vertices, dtype=np.float64)
+            verts = np.ascontiguousarray(path_t.vertices, dtype=np.float32)
             codes = path_t.codes
 
             # Detect snap from stroke width (avoid double-transform via
@@ -108,9 +154,8 @@ class RendererRust(RendererBase):
                 # Pure polyline (MOVETO + N LINETO) — use PolylineData for
                 # stroke-only paths to avoid sending codes entirely.
                 if fill is None and stroke is not None:
-                    pts = np.ascontiguousarray(verts, dtype=np.float32)
                     self._scene.add_polyline_data(
-                        pts.tobytes(),
+                        verts.tobytes(),
                         len(verts),
                         stroke=stroke,
                     )
@@ -175,6 +220,163 @@ class RendererRust(RendererBase):
         # Check if codes contain only M/L/Z (rectilinear candidates)
         mask = (codes == 1) | (codes == 2) | (codes == 79) | (codes == 0)
         return bool(mask.all())
+
+    def draw_path_collection(
+        self,
+        gc,
+        master_transform,
+        paths,
+        all_transforms,
+        offsets,
+        offset_trans,
+        facecolors,
+        edgecolors,
+        linewidths,
+        linestyles,
+        antialiaseds,
+        urls,
+        offset_position,
+    ):
+        # Check if we can batch into PolygonsData (simple line-only polygons,
+        # no dashes).  Falls back to per-path default for curved paths.
+        can_batch = len(paths) > 0
+        if can_batch:
+            for p in paths:
+                if p.codes is not None:
+                    unique = set(p.codes.ravel())
+                    if unique - {0, 1, 2, 79}:
+                        can_batch = False
+                        break
+        if can_batch:
+            for _ls_off, ls_dashes in linestyles:
+                if ls_dashes is not None and len(ls_dashes) > 0:
+                    can_batch = False
+                    break
+        if not can_batch:
+            return super().draw_path_collection(
+                gc,
+                master_transform,
+                paths,
+                all_transforms,
+                offsets,
+                offset_trans,
+                facecolors,
+                edgecolors,
+                linewidths,
+                linestyles,
+                antialiaseds,
+                urls,
+                offset_position,
+            )
+
+        self._apply_clip(gc)
+        y_flip = self._y_flip()
+
+        # Build pre-transformed path templates (display y-down coords).
+        templates = []
+        if len(all_transforms) > 0:
+            for p in paths:
+                for t_mtx in all_transforms:
+                    t = Affine2D(t_mtx)
+                    full = t + master_transform + y_flip
+                    templates.append(p.transformed(full).vertices)
+        else:
+            full = master_transform + y_flip
+            for p in paths:
+                templates.append(p.transformed(full).vertices)
+
+        # Transform offsets to display coords; in y-flipped space offset is (xo, -yo).
+        n_offsets = len(offsets)
+        if n_offsets > 0:
+            display_offsets = offset_trans.transform(np.asarray(offsets))
+            display_offsets = display_offsets.copy()
+            display_offsets[:, 1] *= -1
+
+        n_templates = len(templates)
+        n_facecolors = len(facecolors)
+        n_edgecolors = len(edgecolors)
+        N = max(n_templates, n_offsets if n_offsets > 0 else 1)
+
+        forced_alpha = gc.get_alpha() if gc.get_forced_alpha() else None
+
+        all_verts = []
+        ring_sizes_list = []
+        fill_colors_list = []
+
+        for i in range(N):
+            verts = templates[i % n_templates].copy()
+
+            if n_offsets > 0:
+                off = display_offsets[i % n_offsets]
+                verts[:, 0] += off[0]
+                verts[:, 1] += off[1]
+
+            mask = np.isfinite(verts).all(axis=1)
+            if not mask.all():
+                verts = verts[mask]
+            if len(verts) < 2:
+                continue
+
+            all_verts.append(verts)
+            ring_sizes_list.append(len(verts))
+
+            if n_facecolors > 0:
+                fc = facecolors[i % n_facecolors]
+                if forced_alpha is not None:
+                    fc = [float(fc[0]), float(fc[1]), float(fc[2]), float(forced_alpha)]
+                fill_colors_list.append(fc)
+            else:
+                fill_colors_list.append([0.0, 0.0, 0.0, 0.0])
+
+        if not all_verts:
+            return
+
+        vertices = np.ascontiguousarray(
+            np.concatenate(all_verts, axis=0), dtype=np.float32
+        )
+        ring_sizes = np.array(ring_sizes_list, dtype=np.uint32)
+        fill_colors = np.ascontiguousarray(np.array(fill_colors_list, dtype=np.float32))
+
+        stroke = None
+        if n_edgecolors > 0:
+            ec = edgecolors[0]
+            lw = linewidths[0] if len(linewidths) > 0 else 0.0
+            if lw > 0:
+                alpha = (
+                    forced_alpha
+                    if forced_alpha is not None
+                    else (float(ec[3]) if len(ec) > 3 else 1.0)
+                )
+                pt2px = self.dpi / 72.0
+                cap = gc.get_capstyle()
+                if hasattr(cap, "name"):
+                    cap = cap.name
+                cap = {"butt": "butt", "round": "round", "projecting": "square"}.get(
+                    str(cap), "butt"
+                )
+                join = gc.get_joinstyle()
+                if hasattr(join, "name"):
+                    join = join.name
+                join = {"miter": "miter", "round": "round", "bevel": "bevel"}.get(
+                    str(join), "miter"
+                )
+                stroke = {
+                    "color": [float(ec[0]), float(ec[1]), float(ec[2]), float(alpha)],
+                    "width": float(lw * pt2px),
+                    "line_cap": cap,
+                    "line_join": join,
+                    "dash_array": [],
+                    "dash_offset": 0.0,
+                }
+
+        self._scene.add_polygons_data(
+            vertices.tobytes(),
+            len(vertices),
+            ring_sizes.tobytes(),
+            len(ring_sizes),
+            fill_colors.tobytes(),
+            stroke=stroke,
+        )
 
     def draw_markers(self, gc, marker_path, marker_trans, path, trans, rgbFace=None):
         self._apply_clip(gc)

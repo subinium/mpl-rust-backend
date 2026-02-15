@@ -51,7 +51,28 @@ pub fn segments_to_path(segments: &[PathSegment]) -> Option<tiny_skia::Path> {
     pb.finish()
 }
 
-/// Build a `tiny_skia::Path` from raw vertices (f64 Nx2) and codes (u8 N) blobs.
+/// Read an (x, y) vertex pair from raw bytes at the given byte offset.
+#[inline(always)]
+pub fn read_vertex_f32(raw: &[u8], off: usize) -> (f64, f64) {
+    let mut bx = [0u8; 4];
+    let mut by = [0u8; 4];
+    bx.copy_from_slice(&raw[off..off + 4]);
+    by.copy_from_slice(&raw[off + 4..off + 8]);
+    (f32::from_le_bytes(bx) as f64, f32::from_le_bytes(by) as f64)
+}
+
+#[inline(always)]
+pub fn read_vertex_f64(raw: &[u8], off: usize) -> (f64, f64) {
+    let mut bx = [0u8; 8];
+    let mut by = [0u8; 8];
+    bx.copy_from_slice(&raw[off..off + 8]);
+    by.copy_from_slice(&raw[off + 8..off + 16]);
+    (f64::from_le_bytes(bx), f64::from_le_bytes(by))
+}
+
+/// Build a `tiny_skia::Path` from raw vertices and codes (u8 N) blobs.
+///
+/// Supports both f32 and f64 vertex data via the `dtype` parameter.
 ///
 /// Codes follow the matplotlib convention:
 /// - 1 = MOVETO
@@ -67,41 +88,27 @@ pub fn raw_path_from_vertices_codes(
     codes_raw: &[u8],
     count: usize,
     snap: bool,
+    dtype: &str,
 ) -> Option<tiny_skia::Path> {
     if count == 0 {
         return None;
     }
-    let expected_verts = count.checked_mul(2)?.checked_mul(8)?;
+    let is_f32 = dtype == "f32";
+    let elem = if is_f32 { 4usize } else { 8usize };
+    let stride = elem * 2; // bytes per vertex (2 components)
+    let expected_verts = count.checked_mul(stride)?;
     if vertices_raw.len() != expected_verts || codes_raw.len() != count {
         return None;
     }
+
+    let read_xy = if is_f32 { read_vertex_f32 } else { read_vertex_f64 };
 
     let mut pb = PathBuilder::new();
     let mut i = 0usize;
 
     while i < count {
         let code = codes_raw[i];
-        let off = i * 16;
-        let x = f64::from_le_bytes([
-            vertices_raw[off],
-            vertices_raw[off + 1],
-            vertices_raw[off + 2],
-            vertices_raw[off + 3],
-            vertices_raw[off + 4],
-            vertices_raw[off + 5],
-            vertices_raw[off + 6],
-            vertices_raw[off + 7],
-        ]);
-        let y = f64::from_le_bytes([
-            vertices_raw[off + 8],
-            vertices_raw[off + 9],
-            vertices_raw[off + 10],
-            vertices_raw[off + 11],
-            vertices_raw[off + 12],
-            vertices_raw[off + 13],
-            vertices_raw[off + 14],
-            vertices_raw[off + 15],
-        ]);
+        let (x, y) = read_xy(vertices_raw, i * stride);
 
         match code {
             1 => {
@@ -135,31 +142,11 @@ pub fn raw_path_from_vertices_codes(
                     i += 1;
                     continue;
                 }
-                let off2 = (i + 1) * 16;
-                let x2 = f64::from_le_bytes([
-                    vertices_raw[off2],
-                    vertices_raw[off2 + 1],
-                    vertices_raw[off2 + 2],
-                    vertices_raw[off2 + 3],
-                    vertices_raw[off2 + 4],
-                    vertices_raw[off2 + 5],
-                    vertices_raw[off2 + 6],
-                    vertices_raw[off2 + 7],
-                ]) as f32;
-                let y2 = f64::from_le_bytes([
-                    vertices_raw[off2 + 8],
-                    vertices_raw[off2 + 9],
-                    vertices_raw[off2 + 10],
-                    vertices_raw[off2 + 11],
-                    vertices_raw[off2 + 12],
-                    vertices_raw[off2 + 13],
-                    vertices_raw[off2 + 14],
-                    vertices_raw[off2 + 15],
-                ]) as f32;
-                let x1 = x as f32;
-                let y1 = y as f32;
-                if x1.is_finite() && y1.is_finite() && x2.is_finite() && y2.is_finite() {
-                    pb.quad_to(x1, y1, x2, y2);
+                let (x2, y2) = read_xy(vertices_raw, (i + 1) * stride);
+                let (x1f, y1f) = (x as f32, y as f32);
+                let (x2f, y2f) = (x2 as f32, y2 as f32);
+                if x1f.is_finite() && y1f.is_finite() && x2f.is_finite() && y2f.is_finite() {
+                    pb.quad_to(x1f, y1f, x2f, y2f);
                 }
                 i += 2;
             }
@@ -170,55 +157,16 @@ pub fn raw_path_from_vertices_codes(
                     i += 1;
                     continue;
                 }
-                let off2 = (i + 1) * 16;
-                let x2 = f64::from_le_bytes([
-                    vertices_raw[off2],
-                    vertices_raw[off2 + 1],
-                    vertices_raw[off2 + 2],
-                    vertices_raw[off2 + 3],
-                    vertices_raw[off2 + 4],
-                    vertices_raw[off2 + 5],
-                    vertices_raw[off2 + 6],
-                    vertices_raw[off2 + 7],
-                ]) as f32;
-                let y2 = f64::from_le_bytes([
-                    vertices_raw[off2 + 8],
-                    vertices_raw[off2 + 9],
-                    vertices_raw[off2 + 10],
-                    vertices_raw[off2 + 11],
-                    vertices_raw[off2 + 12],
-                    vertices_raw[off2 + 13],
-                    vertices_raw[off2 + 14],
-                    vertices_raw[off2 + 15],
-                ]) as f32;
-                let off3 = (i + 2) * 16;
-                let x3 = f64::from_le_bytes([
-                    vertices_raw[off3],
-                    vertices_raw[off3 + 1],
-                    vertices_raw[off3 + 2],
-                    vertices_raw[off3 + 3],
-                    vertices_raw[off3 + 4],
-                    vertices_raw[off3 + 5],
-                    vertices_raw[off3 + 6],
-                    vertices_raw[off3 + 7],
-                ]) as f32;
-                let y3 = f64::from_le_bytes([
-                    vertices_raw[off3 + 8],
-                    vertices_raw[off3 + 9],
-                    vertices_raw[off3 + 10],
-                    vertices_raw[off3 + 11],
-                    vertices_raw[off3 + 12],
-                    vertices_raw[off3 + 13],
-                    vertices_raw[off3 + 14],
-                    vertices_raw[off3 + 15],
-                ]) as f32;
-                let x1 = x as f32;
-                let y1 = y as f32;
-                if x1.is_finite() && y1.is_finite()
-                    && x2.is_finite() && y2.is_finite()
-                    && x3.is_finite() && y3.is_finite()
+                let (x2, y2) = read_xy(vertices_raw, (i + 1) * stride);
+                let (x3, y3) = read_xy(vertices_raw, (i + 2) * stride);
+                let (x1f, y1f) = (x as f32, y as f32);
+                let (x2f, y2f) = (x2 as f32, y2 as f32);
+                let (x3f, y3f) = (x3 as f32, y3 as f32);
+                if x1f.is_finite() && y1f.is_finite()
+                    && x2f.is_finite() && y2f.is_finite()
+                    && x3f.is_finite() && y3f.is_finite()
                 {
-                    pb.cubic_to(x1, y1, x2, y2, x3, y3);
+                    pb.cubic_to(x1f, y1f, x2f, y2f, x3f, y3f);
                 }
                 i += 3;
             }
@@ -228,7 +176,7 @@ pub fn raw_path_from_vertices_codes(
                 i += 1;
             }
             _ => {
-                // Unknown code — skip
+                // Unknown code (incl. STOP=0) — skip
                 i += 1;
             }
         }

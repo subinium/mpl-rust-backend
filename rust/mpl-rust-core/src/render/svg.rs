@@ -621,7 +621,7 @@ fn render_svg_node(
         SceneNode::PathData {
             vertices_data,
             vertices_blob,
-            vertices_dtype: _,
+            vertices_dtype,
             codes_data,
             codes_blob,
             count,
@@ -668,7 +668,7 @@ fn render_svg_node(
                 return;
             };
 
-            let d = raw_vertices_codes_to_svg_path(verts_raw, codes_raw, *count, *snap);
+            let d = raw_vertices_codes_to_svg_path(verts_raw, codes_raw, *count, *snap, vertices_dtype);
             if d.is_empty() {
                 return;
             }
@@ -928,16 +928,22 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
 }
 
 /// Convert raw vertices/codes blobs to SVG path data string.
+/// Supports both f32 and f64 vertex data via the `dtype` parameter.
 fn raw_vertices_codes_to_svg_path(
     vertices_raw: &[u8],
     codes_raw: &[u8],
     count: usize,
     snap: bool,
+    dtype: &str,
 ) -> String {
+    use crate::geometry::{read_vertex_f32, read_vertex_f64};
+
     if count == 0 {
         return String::new();
     }
-    let expected_verts = match count.checked_mul(16) {
+    let is_f32 = dtype == "f32";
+    let stride = if is_f32 { 8usize } else { 16usize };
+    let expected_verts = match count.checked_mul(stride) {
         Some(n) => n,
         None => return String::new(),
     };
@@ -945,20 +951,14 @@ fn raw_vertices_codes_to_svg_path(
         return String::new();
     }
 
+    let read_xy = if is_f32 { read_vertex_f32 } else { read_vertex_f64 };
+
     let mut d = String::with_capacity(count * 20);
     let mut i = 0usize;
 
     while i < count {
         let code = codes_raw[i];
-        let off = i * 16;
-        let x = f64::from_le_bytes([
-            vertices_raw[off], vertices_raw[off+1], vertices_raw[off+2], vertices_raw[off+3],
-            vertices_raw[off+4], vertices_raw[off+5], vertices_raw[off+6], vertices_raw[off+7],
-        ]);
-        let y = f64::from_le_bytes([
-            vertices_raw[off+8], vertices_raw[off+9], vertices_raw[off+10], vertices_raw[off+11],
-            vertices_raw[off+12], vertices_raw[off+13], vertices_raw[off+14], vertices_raw[off+15],
-        ]);
+        let (x, y) = read_xy(vertices_raw, i * stride);
 
         match code {
             1 => {
@@ -977,15 +977,7 @@ fn raw_vertices_codes_to_svg_path(
             }
             3 => {
                 if i + 1 >= count { i += 1; continue; }
-                let off2 = (i + 1) * 16;
-                let x2 = f64::from_le_bytes([
-                    vertices_raw[off2], vertices_raw[off2+1], vertices_raw[off2+2], vertices_raw[off2+3],
-                    vertices_raw[off2+4], vertices_raw[off2+5], vertices_raw[off2+6], vertices_raw[off2+7],
-                ]);
-                let y2 = f64::from_le_bytes([
-                    vertices_raw[off2+8], vertices_raw[off2+9], vertices_raw[off2+10], vertices_raw[off2+11],
-                    vertices_raw[off2+12], vertices_raw[off2+13], vertices_raw[off2+14], vertices_raw[off2+15],
-                ]);
+                let (x2, y2) = read_xy(vertices_raw, (i + 1) * stride);
                 if x.is_finite() && y.is_finite() && x2.is_finite() && y2.is_finite() {
                     write!(d, "Q{:.2},{:.2} {:.2},{:.2} ", x, y, x2, y2).unwrap();
                 }
@@ -993,24 +985,8 @@ fn raw_vertices_codes_to_svg_path(
             }
             4 => {
                 if i + 2 >= count { i += 1; continue; }
-                let off2 = (i + 1) * 16;
-                let x2 = f64::from_le_bytes([
-                    vertices_raw[off2], vertices_raw[off2+1], vertices_raw[off2+2], vertices_raw[off2+3],
-                    vertices_raw[off2+4], vertices_raw[off2+5], vertices_raw[off2+6], vertices_raw[off2+7],
-                ]);
-                let y2 = f64::from_le_bytes([
-                    vertices_raw[off2+8], vertices_raw[off2+9], vertices_raw[off2+10], vertices_raw[off2+11],
-                    vertices_raw[off2+12], vertices_raw[off2+13], vertices_raw[off2+14], vertices_raw[off2+15],
-                ]);
-                let off3 = (i + 2) * 16;
-                let x3 = f64::from_le_bytes([
-                    vertices_raw[off3], vertices_raw[off3+1], vertices_raw[off3+2], vertices_raw[off3+3],
-                    vertices_raw[off3+4], vertices_raw[off3+5], vertices_raw[off3+6], vertices_raw[off3+7],
-                ]);
-                let y3 = f64::from_le_bytes([
-                    vertices_raw[off3+8], vertices_raw[off3+9], vertices_raw[off3+10], vertices_raw[off3+11],
-                    vertices_raw[off3+12], vertices_raw[off3+13], vertices_raw[off3+14], vertices_raw[off3+15],
-                ]);
+                let (x2, y2) = read_xy(vertices_raw, (i + 1) * stride);
+                let (x3, y3) = read_xy(vertices_raw, (i + 2) * stride);
                 if x.is_finite() && y.is_finite() && x2.is_finite() && y2.is_finite() && x3.is_finite() && y3.is_finite() {
                     write!(d, "C{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} ", x, y, x2, y2, x3, y3).unwrap();
                 }
