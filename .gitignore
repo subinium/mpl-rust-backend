@@ -1,0 +1,17 @@
+target/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.so
+*.dylib
+*.dll
+.env
+.venv/
+.DS_Store
+.pytest_cache/
+Cargo.lock
+fonts/
+benchmarks/artifacts/

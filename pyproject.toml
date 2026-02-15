@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "mpl-rust-backend"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["matplotlib>=3.5"]
+description = "Drop-in Matplotlib backend powered by a Rust rendering engine (tiny-skia + fontdue)"
+license = { text = "MIT" }
+
+[tool.maturin]
+manifest-path = "rust/mpl-rust-pybridge/Cargo.toml"
+module-name = "mpl_rust_backend._rust"
+python-source = "python"
+features = ["pyo3/extension-module"]

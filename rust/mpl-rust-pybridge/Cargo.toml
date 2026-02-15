@@ -1,0 +1,13 @@
+[package]
+name = "mpl-rust-pybridge"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "mpl_rust_backend"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["abi3-py39", "extension-module"] }
+mpl-rust-core = { path = "../mpl-rust-core" }
+serde_json = "1"
