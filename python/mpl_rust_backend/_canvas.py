@@ -43,9 +43,9 @@ class FigureCanvasRust(FigureCanvasBase):
         json_bytes, blobs = renderer.scene_builder.build()
 
         if blobs:
-            return bytes(render_scene_with_blobs(json_bytes, blobs, fmt))
+            return render_scene_with_blobs(json_bytes, blobs, fmt)
         else:
-            return bytes(render_scene_bytes(json_bytes, fmt))
+            return render_scene_bytes(json_bytes, fmt)
 
     def print_png(self, fname_or_fh, **kwargs):
         data = self._render_to_bytes("png")

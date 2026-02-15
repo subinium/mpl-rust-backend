@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::OnceLock;
 use std::thread;
 
 use png::{BitDepth, ColorType, Compression, FilterType};
@@ -9,24 +10,209 @@ use crate::geometry::{affine_to_transform, build_clip_mask, raw_path_from_vertic
 use crate::scene::{FillStyle, Scene, SceneNode, StrokeStyle};
 use crate::text;
 
+use super::base64::base64_decode;
+use super::dtype::{normalized_dtype, normalized_index_dtype, normalized_color_dtype};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PngProfile {
     Native,
     Size,
 }
 
-fn resolve_png_profile() -> PngProfile {
-    match std::env::var("PLOTIX_PNG_PROFILE") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            if t == "size" || t == "small" || t == "best" {
-                PngProfile::Size
-            } else {
-                PngProfile::Native
+struct RenderConfig {
+    png_profile: PngProfile,
+    image_parallel_mode: String,
+    image_parallel_min_units: usize,
+    image_parallel_max_workers: Option<usize>,
+    markers_parallel_mode: String,
+    marker_splat: bool,
+    marker_splat_parallel: bool,
+    marker_splat_parallel_min_points: usize,
+    marker_stamp: bool,
+    text_oversample_max: f32,
+    text_oversample: Option<f32>,
+    text_max_pixels: Option<usize>,
+    text_snap_pixels: bool,
+    dense_marker_stroke: Option<bool>,
+    dense_marker_aa_disabled: bool,
+    markers_stripes_mode: String,
+    markers_parallel_stack_kb: usize,
+    markers_parallel_target_chunk: Option<usize>,
+    markers_parallel_max_workers: Option<usize>,
+    markers_parallel_max_extra_mb: Option<usize>,
+}
+
+fn config() -> &'static RenderConfig {
+    static CONFIG: OnceLock<RenderConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let png_profile = match std::env::var("PLOTIX_PNG_PROFILE") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                if t == "size" || t == "small" || t == "best" {
+                    PngProfile::Size
+                } else {
+                    PngProfile::Native
+                }
             }
+            Err(_) => PngProfile::Native,
+        };
+
+        let image_parallel_mode = std::env::var("PLOTIX_IMAGE_PARALLEL")
+            .unwrap_or_else(|_| "auto".to_string())
+            .trim()
+            .to_ascii_lowercase();
+
+        let image_parallel_min_units = std::env::var("PLOTIX_IMAGE_PARALLEL_MIN_UNITS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= 16_384)
+            .unwrap_or(262_144);
+
+        let image_parallel_max_workers = std::env::var("PLOTIX_IMAGE_PARALLEL_MAX_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= 1);
+
+        let markers_parallel_mode = std::env::var("PLOTIX_MARKERS_PARALLEL")
+            .unwrap_or_else(|_| "auto".to_string())
+            .trim()
+            .to_ascii_lowercase();
+
+        let marker_splat = match std::env::var("PLOTIX_MARKER_SPLAT") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                !(t == "0" || t == "false" || t == "off" || t == "no")
+            }
+            Err(_) => true,
+        };
+
+        let marker_splat_parallel = match std::env::var("PLOTIX_MARKER_SPLAT_PARALLEL") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                !(t == "0" || t == "false" || t == "off" || t == "no")
+            }
+            Err(_) => true,
+        };
+
+        let marker_splat_parallel_min_points = std::env::var("PLOTIX_MARKER_SPLAT_PARALLEL_MIN_POINTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 50_000)
+            .unwrap_or(80_000);
+
+        let marker_stamp = match std::env::var("PLOTIX_MARKER_STAMP") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                !(t == "0" || t == "false" || t == "off" || t == "no")
+            }
+            Err(_) => false,
+        };
+
+        let text_oversample_max = std::env::var("PLOTIX_TEXT_OVERSAMPLE_MAX")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .map(|v| v.clamp(1.0, 6.0))
+            .unwrap_or(2.5);
+
+        let text_oversample = match std::env::var("PLOTIX_TEXT_OVERSAMPLE") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                if t.is_empty() || t == "auto" {
+                    None
+                } else {
+                    v.parse::<f32>().ok()
+                }
+            }
+            Err(_) => None,
+        };
+
+        let text_max_pixels = std::env::var("PLOTIX_TEXT_MAX_PIXELS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+
+        let text_snap_pixels = match std::env::var("PLOTIX_TEXT_SNAP_PIXELS") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                !(t == "0" || t == "false" || t == "off" || t == "no")
+            }
+            Err(_) => true,
+        };
+
+        let dense_marker_stroke = match std::env::var("PLOTIX_DENSE_MARKER_STROKE") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                if t == "0" || t == "false" || t == "off" || t == "no" {
+                    Some(false)
+                } else {
+                    Some(true)
+                }
+            }
+            Err(_) => None,
+        };
+
+        let dense_marker_aa_disabled = match std::env::var("PLOTIX_DENSE_MARKER_AA") {
+            Ok(v) => {
+                let t = v.trim().to_ascii_lowercase();
+                !(t == "1" || t == "true" || t == "on" || t == "yes")
+            }
+            Err(_) => true,
+        };
+
+        let markers_stripes_mode = std::env::var("PLOTIX_MARKERS_STRIPES")
+            .unwrap_or_else(|_| "auto".to_string())
+            .trim()
+            .to_ascii_lowercase();
+
+        let markers_parallel_stack_kb = match std::env::var("PLOTIX_MARKERS_PARALLEL_STACK_KB") {
+            Ok(v) => v
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|kb| *kb > 0)
+                .unwrap_or(256),
+            Err(_) => 256,
+        };
+
+        let markers_parallel_target_chunk = std::env::var("PLOTIX_MARKERS_PARALLEL_TARGET_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .map(|n| n.clamp(2_000, 200_000));
+
+        let markers_parallel_max_workers = std::env::var("PLOTIX_MARKERS_PARALLEL_MAX_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .map(|n| n.clamp(1, 32));
+
+        let markers_parallel_max_extra_mb = std::env::var("PLOTIX_MARKERS_PARALLEL_MAX_EXTRA_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|mb| *mb > 0);
+
+        RenderConfig {
+            png_profile,
+            image_parallel_mode,
+            image_parallel_min_units,
+            image_parallel_max_workers,
+            markers_parallel_mode,
+            marker_splat,
+            marker_splat_parallel,
+            marker_splat_parallel_min_points,
+            marker_stamp,
+            text_oversample_max,
+            text_oversample,
+            text_max_pixels,
+            text_snap_pixels,
+            dense_marker_stroke,
+            dense_marker_aa_disabled,
+            markers_stripes_mode,
+            markers_parallel_stack_kb,
+            markers_parallel_target_chunk,
+            markers_parallel_max_workers,
+            markers_parallel_max_extra_mb,
         }
-        Err(_) => PngProfile::Native,
-    }
+    })
 }
 
 #[inline]
@@ -35,19 +221,11 @@ fn image_parallel_worker_count(units: usize, structure_limit: usize) -> usize {
         return 1;
     }
 
-    let mode = std::env::var("PLOTIX_IMAGE_PARALLEL")
-        .unwrap_or_else(|_| "auto".to_string())
-        .trim()
-        .to_ascii_lowercase();
-    let min_units = std::env::var("PLOTIX_IMAGE_PARALLEL_MIN_UNITS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v >= 16_384)
-        .unwrap_or(262_144);
-    let enabled = match mode.as_str() {
+    let cfg = config();
+    let enabled = match cfg.image_parallel_mode.as_str() {
         "0" | "false" | "off" | "no" => false,
         "1" | "true" | "on" | "yes" => true,
-        _ => units >= min_units,
+        _ => units >= cfg.image_parallel_min_units,
     };
     if !enabled {
         return 1;
@@ -56,11 +234,7 @@ fn image_parallel_worker_count(units: usize, structure_limit: usize) -> usize {
     let max_threads = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let env_cap = std::env::var("PLOTIX_IMAGE_PARALLEL_MAX_WORKERS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(max_threads);
+    let env_cap = cfg.image_parallel_max_workers.unwrap_or(max_threads);
     max_threads
         .min(env_cap)
         .min(structure_limit)
@@ -120,7 +294,7 @@ fn unpremultiply_rgba(raw: &[u8]) -> Vec<u8> {
 }
 
 fn encode_pixmap_png(pixmap: &Pixmap) -> Vec<u8> {
-    let profile = resolve_png_profile();
+    let profile = config().png_profile;
     if profile == PngProfile::Native {
         return pixmap.encode_png().expect("failed to encode PNG");
     }
@@ -229,25 +403,78 @@ fn render_node(
                 let height = pixmap.height();
 
                 if let Some(mask) = build_clip_mask(clip_rect, combined, width, height) {
-                    // Render children into a temp buffer.
-                    let mut tmp = Pixmap::new(width, height).expect("alloc temp pixmap");
-                    for child in children {
-                        render_node(&mut tmp, child, combined, combined_alpha, blobs);
+                    // Calculate clip bounds in pixel coordinates by transforming clip rect corners.
+                    let corners = [
+                        (clip_rect.x as f32, clip_rect.y as f32),
+                        ((clip_rect.x + clip_rect.width) as f32, clip_rect.y as f32),
+                        (clip_rect.x as f32, (clip_rect.y + clip_rect.height) as f32),
+                        ((clip_rect.x + clip_rect.width) as f32, (clip_rect.y + clip_rect.height) as f32),
+                    ];
+                    let mut px_min_x = f32::MAX;
+                    let mut px_min_y = f32::MAX;
+                    let mut px_max_x = f32::MIN;
+                    let mut px_max_y = f32::MIN;
+                    for (lx, ly) in corners {
+                        let px = combined.sx * lx + combined.kx * ly + combined.tx;
+                        let py = combined.ky * lx + combined.sy * ly + combined.ty;
+                        if px < px_min_x { px_min_x = px; }
+                        if py < px_min_y { px_min_y = py; }
+                        if px > px_max_x { px_max_x = px; }
+                        if py > px_max_y { px_max_y = py; }
                     }
+                    let cx = (px_min_x.floor() as i32).max(0) as u32;
+                    let cy = (px_min_y.floor() as i32).max(0) as u32;
+                    let cw = ((px_max_x.ceil() as u32).min(width)).saturating_sub(cx).max(1);
+                    let ch = ((px_max_y.ceil() as u32).min(height)).saturating_sub(cy).max(1);
 
-                    // Composite the temp buffer through the clip mask.
-                    pixmap.draw_pixmap(
-                        0,
-                        0,
-                        tmp.as_ref(),
-                        &tiny_skia::PixmapPaint {
-                            opacity: 1.0,
-                            blend_mode: tiny_skia::BlendMode::SourceOver,
-                            quality: tiny_skia::FilterQuality::Bilinear,
-                        },
-                        Transform::identity(),
-                        Some(&mask),
-                    );
+                    // Use a smaller pixmap if the clip rect is less than 75% of canvas area.
+                    let clip_area = (cw as u64) * (ch as u64);
+                    let canvas_area = (width as u64) * (height as u64);
+                    let use_offset = clip_area * 4 < canvas_area * 3 && cw < width && ch < height;
+
+                    if use_offset {
+                        if let Some(mut tmp) = Pixmap::new(cw, ch) {
+                            // Offset children rendering by -cx, -cy so they render into the smaller pixmap.
+                            let offset = Transform::from_translate(-(cx as f32), -(cy as f32));
+                            let offset_combined = offset.pre_concat(combined);
+                            for child in children {
+                                render_node(&mut tmp, child, offset_combined, combined_alpha, blobs);
+                            }
+
+                            // Composite the temp buffer at the clip position through the clip mask.
+                            pixmap.draw_pixmap(
+                                cx as i32,
+                                cy as i32,
+                                tmp.as_ref(),
+                                &tiny_skia::PixmapPaint {
+                                    opacity: 1.0,
+                                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                                    quality: tiny_skia::FilterQuality::Bilinear,
+                                },
+                                Transform::identity(),
+                                Some(&mask),
+                            );
+                        }
+                    } else {
+                        // Clip rect covers most of the canvas; use full-size temp pixmap.
+                        let mut tmp = Pixmap::new(width, height).expect("alloc temp pixmap");
+                        for child in children {
+                            render_node(&mut tmp, child, combined, combined_alpha, blobs);
+                        }
+
+                        pixmap.draw_pixmap(
+                            0,
+                            0,
+                            tmp.as_ref(),
+                            &tiny_skia::PixmapPaint {
+                                opacity: 1.0,
+                                blend_mode: tiny_skia::BlendMode::SourceOver,
+                                quality: tiny_skia::FilterQuality::Bilinear,
+                            },
+                            Transform::identity(),
+                            Some(&mask),
+                        );
+                    }
                 }
             } else {
                 for child in children {
@@ -380,13 +607,19 @@ fn render_node(
                 return;
             }
 
-            // Premultiply RGBA
+            // Premultiply RGBA using integer-only arithmetic
             let mut premul = raw.to_vec();
             for pixel in premul.chunks_exact_mut(4) {
-                let a = pixel[3] as f32 / 255.0;
-                pixel[0] = (pixel[0] as f32 * a + 0.5) as u8;
-                pixel[1] = (pixel[1] as f32 * a + 0.5) as u8;
-                pixel[2] = (pixel[2] as f32 * a + 0.5) as u8;
+                let a = pixel[3] as u16;
+                if a == 0 {
+                    pixel[0] = 0;
+                    pixel[1] = 0;
+                    pixel[2] = 0;
+                } else if a < 255 {
+                    pixel[0] = ((pixel[0] as u16 * a + 127) / 255) as u8;
+                    pixel[1] = ((pixel[1] as u16 * a + 127) / 255) as u8;
+                    pixel[2] = ((pixel[2] as u16 * a + 127) / 255) as u8;
+                }
             }
 
             let Some(size) = tiny_skia::IntSize::from_wh(img_w, img_h) else {
@@ -737,12 +970,18 @@ fn render_node(
                 let expected_len = (img_w * img_h * 4) as usize;
 
                 if raw_bytes.len() == expected_len {
-                    // Convert RGBA to premultiplied RGBA as required by tiny-skia.
+                    // Convert RGBA to premultiplied RGBA using integer-only arithmetic.
                     for pixel in raw_bytes.chunks_exact_mut(4) {
-                        let a = pixel[3] as f32 / 255.0;
-                        pixel[0] = (pixel[0] as f32 * a + 0.5) as u8;
-                        pixel[1] = (pixel[1] as f32 * a + 0.5) as u8;
-                        pixel[2] = (pixel[2] as f32 * a + 0.5) as u8;
+                        let a = pixel[3] as u16;
+                        if a == 0 {
+                            pixel[0] = 0;
+                            pixel[1] = 0;
+                            pixel[2] = 0;
+                        } else if a < 255 {
+                            pixel[0] = ((pixel[0] as u16 * a + 127) / 255) as u8;
+                            pixel[1] = ((pixel[1] as u16 * a + 127) / 255) as u8;
+                            pixel[2] = ((pixel[2] as u16 * a + 127) / 255) as u8;
+                        }
                     }
 
                     if let Some(img_pixmap) = Pixmap::from_vec(
@@ -871,16 +1110,16 @@ fn make_stroke(style: &StrokeStyle, _parent_transform: Transform) -> Stroke {
     let mut stroke = Stroke::default();
     stroke.width = style.width as f32;
 
-    stroke.line_cap = match style.line_cap.as_str() {
-        "round" => LineCap::Round,
-        "square" => LineCap::Square,
-        _ => LineCap::Butt,
+    stroke.line_cap = match style.line_cap {
+        crate::scene::LineCap::Round => LineCap::Round,
+        crate::scene::LineCap::Square => LineCap::Square,
+        crate::scene::LineCap::Butt => LineCap::Butt,
     };
 
-    stroke.line_join = match style.line_join.as_str() {
-        "round" => LineJoin::Round,
-        "bevel" => LineJoin::Bevel,
-        _ => LineJoin::Miter,
+    stroke.line_join = match style.line_join {
+        crate::scene::LineJoin::Round => LineJoin::Round,
+        crate::scene::LineJoin::Bevel => LineJoin::Bevel,
+        crate::scene::LineJoin::Miter => LineJoin::Miter,
     };
 
     if !style.dash_array.is_empty() {
@@ -1557,23 +1796,41 @@ where
     let scaled_kx = combined.kx * marker_scale;
     let scaled_sy = combined.sy * marker_scale;
 
-    let use_parallel = match std::env::var("PLOTIX_MARKERS_PARALLEL") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            if t == "0" || t == "false" || t == "off" || t == "no" {
-                false
-            } else if t == "1" || t == "true" || t == "on" || t == "yes" {
-                true
-            } else {
-                count >= 30_000
-            }
-        }
-        Err(_) => count >= 30_000,
+    let use_parallel = match config().markers_parallel_mode.as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => count >= 30_000,
     };
     let dense_tiny_markers = count >= 20_000 && size <= 3.0;
     let dense_markers = dense_tiny_markers && should_disable_dense_marker_aa();
     let skip_dense_stroke = should_skip_dense_marker_stroke(dense_tiny_markers, size, fill, stroke);
     let circle_like_marker = is_circle_like_marker_path(marker_path);
+
+    // ── General stamp-cache fast path ─────────────────────────────────
+    // Rasterize the marker once, blit at each position.
+    if try_render_markers_stamp_raw(
+        pixmap,
+        &path,
+        raw,
+        bytes_per_point,
+        decode_point,
+        count,
+        fill,
+        stroke,
+        skip_dense_stroke,
+        dense_markers,
+        parent_alpha,
+        parent_transform,
+        marker_scale,
+        combined,
+        scaled_sx,
+        scaled_ky,
+        scaled_kx,
+        scaled_sy,
+        positions_affine,
+    ) {
+        return Ok(());
+    }
 
     if should_use_marker_stamp_fastpath()
         && skip_dense_stroke
@@ -1829,6 +2086,250 @@ where
     Ok(())
 }
 
+/// Stamp-cache for raw-interleaved marker data: rasterize the marker once,
+/// then blit at each decoded position.
+#[allow(clippy::too_many_arguments)]
+fn try_render_markers_stamp_raw<F>(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    raw: &[u8],
+    bytes_per_point: usize,
+    decode_point: F,
+    count: usize,
+    fill: &Option<crate::scene::FillStyle>,
+    stroke: &Option<StrokeStyle>,
+    skip_dense_stroke: bool,
+    dense_markers: bool,
+    parent_alpha: f64,
+    parent_transform: Transform,
+    marker_scale: f32,
+    combined: Transform,
+    scaled_sx: f32,
+    scaled_ky: f32,
+    scaled_kx: f32,
+    scaled_sy: f32,
+    positions_affine: Option<PositionAffine>,
+) -> bool
+where
+    F: Fn(&[u8]) -> (f32, f32),
+{
+    // Build the stamp (same logic as try_render_markers_stamp).
+    let bounds = path.bounds();
+    let corners = [
+        (bounds.left(), bounds.top()),
+        (bounds.right(), bounds.top()),
+        (bounds.left(), bounds.bottom()),
+        (bounds.right(), bounds.bottom()),
+    ];
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for &(cx, cy) in &corners {
+        let tx = scaled_sx * cx + scaled_kx * cy;
+        let ty = scaled_ky * cx + scaled_sy * cy;
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    }
+
+    let effective_stroke = if skip_dense_stroke { None } else { stroke.as_ref() };
+    if let Some(s) = effective_stroke {
+        let sw = (s.width as f32 / marker_scale.abs().max(1e-6)).max(0.5) + 0.5;
+        min_x -= sw;
+        min_y -= sw;
+        max_x += sw;
+        max_y += sw;
+    }
+
+    let pad: f32 = 2.0;
+    min_x -= pad;
+    min_y -= pad;
+    max_x += pad;
+    max_y += pad;
+
+    let stamp_w = (max_x - min_x).ceil() as u32;
+    let stamp_h = (max_y - min_y).ceil() as u32;
+
+    if stamp_w == 0 || stamp_h == 0 || stamp_w > 256 || stamp_h > 256 {
+        return false;
+    }
+
+    let Some(mut stamp) = Pixmap::new(stamp_w, stamp_h) else {
+        return false;
+    };
+
+    let stamp_transform = Transform {
+        sx: scaled_sx,
+        ky: scaled_ky,
+        kx: scaled_kx,
+        sy: scaled_sy,
+        tx: -min_x,
+        ty: -min_y,
+    };
+
+    if let Some(fill_style) = fill.as_ref() {
+        let mut paint = make_fill_paint(&fill_style.color, parent_alpha);
+        if dense_markers {
+            paint.anti_alias = false;
+        }
+        stamp.fill_path(path, &paint, FillRule::Winding, stamp_transform, None);
+    }
+    if let Some(stroke_style) = effective_stroke {
+        let mut paint = make_fill_paint(&stroke_style.color, parent_alpha);
+        if dense_markers {
+            paint.anti_alias = false;
+        }
+        let sk_stroke = make_marker_stroke(stroke_style, parent_transform, marker_scale);
+        let stroke_mt = stamp_transform.pre_concat(Transform::from_translate(0.5, 0.5));
+        stamp.stroke_path(path, &paint, &sk_stroke, stroke_mt, None);
+    }
+
+    if stamp.data().iter().all(|&b| b == 0) {
+        return true;
+    }
+
+    let stamp_bytes = stamp.data();
+    let dst_w = pixmap.width();
+    let dst_h = pixmap.height();
+    let dst_data = pixmap.data_mut();
+
+    for chunk in raw.chunks_exact(bytes_per_point).take(count) {
+        let (x_raw, y_raw) = decode_point(chunk);
+        let (px, py) = apply_position_affine(positions_affine, x_raw, y_raw);
+        let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
+        let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
+        let blit_x = (screen_tx + min_x).round() as i32;
+        let blit_y = (screen_ty + min_y).round() as i32;
+        fast_blit_stamp(dst_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+    }
+
+    true
+}
+
+/// Stamp-cache marker rendering: rasterize the marker once into a small pixmap,
+/// then blit it at each position. Returns `true` if the optimisation was applied.
+#[allow(clippy::too_many_arguments)]
+fn try_render_markers_stamp<P: Point2>(
+    pixmap: &mut Pixmap,
+    path: &tiny_skia::Path,
+    positions: &[P],
+    fill: &Option<crate::scene::FillStyle>,
+    stroke: &Option<StrokeStyle>,
+    skip_dense_stroke: bool,
+    dense_markers: bool,
+    parent_alpha: f64,
+    parent_transform: Transform,
+    marker_scale: f32,
+    combined: Transform,
+    scaled_sx: f32,
+    scaled_ky: f32,
+    scaled_kx: f32,
+    scaled_sy: f32,
+    positions_affine: Option<PositionAffine>,
+) -> bool {
+    // Compute the transformed bounding box of the marker path.
+    let bounds = path.bounds();
+    let corners = [
+        (bounds.left(), bounds.top()),
+        (bounds.right(), bounds.top()),
+        (bounds.left(), bounds.bottom()),
+        (bounds.right(), bounds.bottom()),
+    ];
+    let mut min_x = f32::MAX;
+    let mut min_y = f32::MAX;
+    let mut max_x = f32::MIN;
+    let mut max_y = f32::MIN;
+    for &(cx, cy) in &corners {
+        let tx = scaled_sx * cx + scaled_kx * cy;
+        let ty = scaled_ky * cx + scaled_sy * cy;
+        min_x = min_x.min(tx);
+        min_y = min_y.min(ty);
+        max_x = max_x.max(tx);
+        max_y = max_y.max(ty);
+    }
+
+    // Account for stroke width.
+    let effective_stroke = if skip_dense_stroke { None } else { stroke.as_ref() };
+    if let Some(s) = effective_stroke {
+        let sw = (s.width as f32 / marker_scale.abs().max(1e-6)).max(0.5) + 0.5;
+        min_x -= sw;
+        min_y -= sw;
+        max_x += sw;
+        max_y += sw;
+    }
+
+    // Anti-aliasing padding.
+    let pad: f32 = 2.0;
+    min_x -= pad;
+    min_y -= pad;
+    max_x += pad;
+    max_y += pad;
+
+    let stamp_w = (max_x - min_x).ceil() as u32;
+    let stamp_h = (max_y - min_y).ceil() as u32;
+
+    // Skip for degenerate or very large markers (diminishing returns).
+    if stamp_w == 0 || stamp_h == 0 || stamp_w > 256 || stamp_h > 256 {
+        return false;
+    }
+
+    // Create stamp pixmap.
+    let Some(mut stamp) = Pixmap::new(stamp_w, stamp_h) else {
+        return false;
+    };
+
+    // Render marker centered in the stamp: (0,0) in marker space -> (-min_x, -min_y) in stamp.
+    let stamp_transform = Transform {
+        sx: scaled_sx,
+        ky: scaled_ky,
+        kx: scaled_kx,
+        sy: scaled_sy,
+        tx: -min_x,
+        ty: -min_y,
+    };
+
+    if let Some(fill_style) = fill.as_ref() {
+        let mut paint = make_fill_paint(&fill_style.color, parent_alpha);
+        if dense_markers {
+            paint.anti_alias = false;
+        }
+        stamp.fill_path(path, &paint, FillRule::Winding, stamp_transform, None);
+    }
+    if let Some(stroke_style) = effective_stroke {
+        let mut paint = make_fill_paint(&stroke_style.color, parent_alpha);
+        if dense_markers {
+            paint.anti_alias = false;
+        }
+        let sk_stroke = make_marker_stroke(stroke_style, parent_transform, marker_scale);
+        let stroke_mt = stamp_transform.pre_concat(Transform::from_translate(0.5, 0.5));
+        stamp.stroke_path(path, &paint, &sk_stroke, stroke_mt, None);
+    }
+
+    // Check if stamp is completely empty.
+    if stamp.data().iter().all(|&b| b == 0) {
+        return true; // nothing visible
+    }
+
+    // Blit stamp at each position using direct pixel blending.
+    let stamp_bytes = stamp.data();
+    let dst_w = pixmap.width();
+    let dst_h = pixmap.height();
+    let dst_data = pixmap.data_mut();
+
+    for pos in positions {
+        let (px, py) = apply_position_affine(positions_affine, pos.x_f32(), pos.y_f32());
+        let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
+        let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
+        let blit_x = (screen_tx + min_x).round() as i32;
+        let blit_y = (screen_ty + min_y).round() as i32;
+        fast_blit_stamp(dst_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+    }
+
+    true
+}
+
 fn render_markers_positions<P: Point2 + Sync>(
     pixmap: &mut Pixmap,
     marker_path: &[crate::scene::PathSegment],
@@ -1857,23 +2358,40 @@ fn render_markers_positions<P: Point2 + Sync>(
     let scaled_ky = combined.ky * marker_scale;
     let scaled_kx = combined.kx * marker_scale;
     let scaled_sy = combined.sy * marker_scale;
-    let use_parallel = match std::env::var("PLOTIX_MARKERS_PARALLEL") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            if t == "0" || t == "false" || t == "off" || t == "no" {
-                false
-            } else if t == "1" || t == "true" || t == "on" || t == "yes" {
-                true
-            } else {
-                positions.len() >= 30_000
-            }
-        }
-        Err(_) => positions.len() >= 30_000,
+    let use_parallel = match config().markers_parallel_mode.as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => positions.len() >= 30_000,
     };
     let dense_tiny_markers = positions.len() >= 20_000 && size <= 3.0;
     let dense_markers = dense_tiny_markers && should_disable_dense_marker_aa();
     let skip_dense_stroke = should_skip_dense_marker_stroke(dense_tiny_markers, size, fill, stroke);
     let positions_affine = position_affine_from_opt(positions_transform);
+
+    // ── Stamp-cache fast path ──────────────────────────────────────────
+    // Rasterize the marker once into a small pixmap, then blit at each
+    // position.  This avoids re-rasterizing the path for every marker and
+    // is the same strategy Agg uses.
+    if try_render_markers_stamp(
+        pixmap,
+        &path,
+        positions,
+        fill,
+        stroke,
+        skip_dense_stroke,
+        dense_markers,
+        parent_alpha,
+        parent_transform,
+        marker_scale,
+        combined,
+        scaled_sx,
+        scaled_ky,
+        scaled_kx,
+        scaled_sy,
+        positions_affine,
+    ) {
+        return;
+    }
 
     if use_parallel && positions.len() >= 25_000 {
         let max_threads = thread::available_parallelism()
@@ -2283,7 +2801,7 @@ fn is_circle_like_marker_path(marker_path: &[crate::scene::PathSegment]) -> bool
     let Some(last) = marker_path.last() else {
         return false;
     };
-    if last.cmd != "Z" {
+    if last.cmd != crate::scene::PathCmd::Z {
         return false;
     }
 
@@ -2363,42 +2881,79 @@ fn blend_premul_over_scaled(dst: &mut [u8], src: [u8; 4], coverage: f32) {
     blend_premul_over(dst, scaled);
 }
 
-fn should_use_marker_splat_fastpath() -> bool {
-    match std::env::var("PLOTIX_MARKER_SPLAT") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            !(t == "0" || t == "false" || t == "off" || t == "no")
-        }
-        Err(_) => true,
+/// Direct pixel-level stamp blit — avoids `draw_pixmap` per-call overhead.
+/// Operates on raw premultiplied-RGBA buffers, skipping fully-transparent pixels.
+#[inline(never)]
+fn fast_blit_stamp(
+    dst_data: &mut [u8],
+    dst_width: u32,
+    dst_height: u32,
+    stamp_data: &[u8],
+    stamp_width: u32,
+    stamp_height: u32,
+    x: i32,
+    y: i32,
+) {
+    let dw = dst_width as i32;
+    let dh = dst_height as i32;
+    let sw = stamp_width as i32;
+    let sh = stamp_height as i32;
+
+    // Clip source region to destination bounds.
+    let src_x0 = 0i32.max(-x);
+    let src_y0 = 0i32.max(-y);
+    let dst_x0 = 0i32.max(x);
+    let dst_y0 = 0i32.max(y);
+    let copy_w = (sw - src_x0).min(dw - dst_x0);
+    let copy_h = (sh - src_y0).min(dh - dst_y0);
+    if copy_w <= 0 || copy_h <= 0 {
+        return;
     }
+    let copy_w = copy_w as usize;
+
+    for row in 0..copy_h {
+        let src_row = (src_y0 + row) as usize;
+        let dst_row = (dst_y0 + row) as usize;
+        let src_base = (src_row * sw as usize + src_x0 as usize) * 4;
+        let dst_base = (dst_row * dw as usize + dst_x0 as usize) * 4;
+
+        for col in 0..copy_w {
+            let si = src_base + col * 4;
+            let di = dst_base + col * 4;
+            let sa = stamp_data[si + 3] as u16;
+            if sa == 0 {
+                continue;
+            }
+            if sa == 255 {
+                dst_data[di] = stamp_data[si];
+                dst_data[di + 1] = stamp_data[si + 1];
+                dst_data[di + 2] = stamp_data[si + 2];
+                dst_data[di + 3] = 255;
+                continue;
+            }
+            let inv = 255u16 - sa;
+            dst_data[di] = (stamp_data[si] as u16 + ((dst_data[di] as u16 * inv + 127) / 255)) as u8;
+            dst_data[di + 1] = (stamp_data[si + 1] as u16 + ((dst_data[di + 1] as u16 * inv + 127) / 255)) as u8;
+            dst_data[di + 2] = (stamp_data[si + 2] as u16 + ((dst_data[di + 2] as u16 * inv + 127) / 255)) as u8;
+            dst_data[di + 3] = (stamp_data[si + 3] as u16 + ((dst_data[di + 3] as u16 * inv + 127) / 255)) as u8;
+        }
+    }
+}
+
+fn should_use_marker_splat_fastpath() -> bool {
+    config().marker_splat
 }
 
 fn should_use_marker_splat_parallel() -> bool {
-    match std::env::var("PLOTIX_MARKER_SPLAT_PARALLEL") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            !(t == "0" || t == "false" || t == "off" || t == "no")
-        }
-        Err(_) => true,
-    }
+    config().marker_splat_parallel
 }
 
 fn marker_splat_parallel_min_points() -> usize {
-    std::env::var("PLOTIX_MARKER_SPLAT_PARALLEL_MIN_POINTS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|n| *n >= 50_000)
-        .unwrap_or(80_000)
+    config().marker_splat_parallel_min_points
 }
 
 fn should_use_marker_stamp_fastpath() -> bool {
-    match std::env::var("PLOTIX_MARKER_STAMP") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            !(t == "0" || t == "false" || t == "off" || t == "no")
-        }
-        Err(_) => false,
-    }
+    config().marker_stamp
 }
 
 #[inline]
@@ -2740,31 +3295,17 @@ fn transform_effective_scale(t: Transform) -> f32 {
 }
 
 fn resolve_text_oversample(text_transform: Transform, text_w: f32, text_h: f32) -> f32 {
+    let cfg = config();
     let auto_scale = transform_effective_scale(text_transform);
-    let max_oversample = std::env::var("PLOTIX_TEXT_OVERSAMPLE_MAX")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .map(|v| v.clamp(1.0, 6.0))
-        .unwrap_or(2.5);
+    let max_oversample = cfg.text_oversample_max;
 
-    let mut oversample = match std::env::var("PLOTIX_TEXT_OVERSAMPLE") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            if t.is_empty() || t == "auto" {
-                auto_scale
-            } else {
-                v.parse::<f32>().ok().unwrap_or(auto_scale)
-            }
-        }
-        Err(_) => auto_scale,
-    }
-    .clamp(1.0, max_oversample);
+    let mut oversample = cfg.text_oversample
+        .unwrap_or(auto_scale)
+        .clamp(1.0, max_oversample);
 
     // Bound peak raster memory for very long strings / high DPI.
-    let max_pixels = std::env::var("PLOTIX_TEXT_MAX_PIXELS")
-        .ok()
-        .and_then(|v| v.parse::<f32>().ok())
-        .map(|v| v.max(16_384.0))
+    let max_pixels = cfg.text_max_pixels
+        .map(|v| (v as f32).max(16_384.0))
         .unwrap_or(2_000_000.0);
     let est_w = text_w.max(1.0) * oversample;
     let est_h = text_h.max(1.0) * oversample;
@@ -2776,15 +3317,7 @@ fn resolve_text_oversample(text_transform: Transform, text_w: f32, text_h: f32) 
 }
 
 fn should_snap_text_to_pixels(rotation_deg: f64) -> bool {
-    let default_enabled = true;
-    let enabled = match std::env::var("PLOTIX_TEXT_SNAP_PIXELS") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            !(t == "0" || t == "false" || t == "off" || t == "no")
-        }
-        Err(_) => default_enabled,
-    };
-    enabled && rotation_deg.abs() <= 1e-6
+    config().text_snap_pixels && rotation_deg.abs() <= 1e-6
 }
 
 fn should_skip_dense_marker_stroke(
@@ -2818,97 +3351,57 @@ fn should_skip_dense_marker_stroke(
     if !same_color {
         return false;
     }
-    match std::env::var("PLOTIX_DENSE_MARKER_STROKE") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            t == "0" || t == "false" || t == "off" || t == "no"
-        }
-        Err(_) => true,
+    // dense_marker_stroke: None means env var not set (default: skip stroke = true),
+    // Some(false) means explicitly disabled (skip stroke = true),
+    // Some(true) means explicitly enabled (skip stroke = false).
+    match config().dense_marker_stroke {
+        Some(false) => true,   // stroke disabled -> skip it
+        Some(true) => false,   // stroke explicitly enabled -> don't skip
+        None => true,          // default: skip redundant stroke
     }
 }
 
 fn should_disable_dense_marker_aa() -> bool {
-    match std::env::var("PLOTIX_DENSE_MARKER_AA") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            !(t == "1" || t == "true" || t == "on" || t == "yes")
-        }
-        Err(_) => true,
-    }
+    config().dense_marker_aa_disabled
 }
 
 fn should_use_marker_stripes(point_count: usize) -> bool {
-    match std::env::var("PLOTIX_MARKERS_STRIPES") {
-        Ok(v) => {
-            let t = v.trim().to_ascii_lowercase();
-            if t == "0" || t == "false" || t == "off" || t == "no" {
-                false
-            } else if t == "1" || t == "true" || t == "on" || t == "yes" {
-                true
-            } else {
-                point_count >= 2_000_000
-            }
-        }
-        Err(_) => point_count >= 2_000_000,
+    match config().markers_stripes_mode.as_str() {
+        "0" | "false" | "off" | "no" => false,
+        "1" | "true" | "on" | "yes" => true,
+        _ => point_count >= 2_000_000,
     }
 }
 
 fn markers_parallel_stack_bytes() -> usize {
-    let kb = match std::env::var("PLOTIX_MARKERS_PARALLEL_STACK_KB") {
-        Ok(v) => v
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|kb| *kb > 0)
-            .unwrap_or(256),
-        Err(_) => 256,
-    };
-    kb.clamp(64, 4096).saturating_mul(1024)
+    config().markers_parallel_stack_kb.clamp(64, 4096).saturating_mul(1024)
 }
 
 fn markers_parallel_target_chunk(point_count: usize) -> usize {
-    match std::env::var("PLOTIX_MARKERS_PARALLEL_TARGET_CHUNK") {
-        Ok(v) => v
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(|n| n.clamp(2_000, 200_000))
-            .unwrap_or(16_000),
-        Err(_) => {
-            if point_count >= 1_000_000 {
-                20_000
-            } else if point_count >= 500_000 {
-                18_000
-            } else if point_count >= 200_000 {
-                16_000
-            } else {
-                24_000
-            }
-        }
+    if let Some(chunk) = config().markers_parallel_target_chunk {
+        chunk
+    } else if point_count >= 1_000_000 {
+        20_000
+    } else if point_count >= 500_000 {
+        18_000
+    } else if point_count >= 200_000 {
+        16_000
+    } else {
+        24_000
     }
 }
 
 fn markers_parallel_worker_cap(point_count: usize) -> usize {
-    match std::env::var("PLOTIX_MARKERS_PARALLEL_MAX_WORKERS") {
-        Ok(v) => v
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(|n| n.clamp(1, 32))
-            .unwrap_or(6),
-        Err(_) => {
-            if point_count >= 1_000_000 {
-                6
-            } else if point_count >= 300_000 {
-                5
-            } else if point_count >= 100_000 {
-                4
-            } else {
-                3
-            }
-        }
+    if let Some(cap) = config().markers_parallel_max_workers {
+        cap
+    } else if point_count >= 1_000_000 {
+        6
+    } else if point_count >= 300_000 {
+        5
+    } else if point_count >= 100_000 {
+        4
+    } else {
+        3
     }
 }
 
@@ -2927,63 +3420,21 @@ fn markers_parallel_pixel_cap_mb(pixel_count: usize) -> usize {
 }
 
 fn markers_parallel_max_extra_mb(point_count: usize, pixel_count: usize) -> usize {
-    let base_mb = match std::env::var("PLOTIX_MARKERS_PARALLEL_MAX_EXTRA_MB") {
-        Ok(v) => v
-            .trim()
-            .parse::<usize>()
-            .ok()
-            .filter(|mb| *mb > 0)
-            .unwrap_or(32),
-        Err(_) => {
-            if point_count >= 1_000_000 {
-                32
-            } else if point_count >= 400_000 {
-                24
-            } else if point_count >= 100_000 {
-                16
-            } else {
-                12
-            }
-        }
+    let base_mb = if let Some(mb) = config().markers_parallel_max_extra_mb {
+        mb
+    } else if point_count >= 1_000_000 {
+        32
+    } else if point_count >= 400_000 {
+        24
+    } else if point_count >= 100_000 {
+        16
+    } else {
+        12
     };
     let hard_cap = markers_parallel_pixel_cap_mb(pixel_count);
     base_mb.min(hard_cap).clamp(4, 512)
 }
 
-fn normalized_dtype(dtype: &str) -> &'static str {
-    let d = dtype.to_ascii_lowercase();
-    if d == "f64" || d.contains("float64") || d.contains("f8") {
-        "f64"
-    } else if d == "f32" || d.contains("float32") || d.contains("f4") {
-        "f32"
-    } else if d == "u8" || d.contains("uint8") || d.contains("u1") || d.contains("ubyte") {
-        "u8"
-    } else {
-        "unknown"
-    }
-}
-
-fn normalized_index_dtype(dtype: &str) -> &'static str {
-    let d = dtype.to_ascii_lowercase();
-    if d == "u64" || d.contains("uint64") || d.contains("u8") {
-        "u64"
-    } else if d == "u32" || d.contains("uint32") || d.contains("u4") {
-        "u32"
-    } else {
-        "unknown"
-    }
-}
-
-fn normalized_color_dtype(dtype: &str) -> &'static str {
-    let d = dtype.to_ascii_lowercase();
-    if d == "f64" || d.contains("float64") || d.contains("f8") {
-        "f64"
-    } else if d == "f32" || d.contains("float32") || d.contains("f4") {
-        "f32"
-    } else {
-        "unknown"
-    }
-}
 
 fn color_to_premul_rgba8(color: [f64; 4], alpha_factor: f64) -> [u8; 4] {
     let r = color[0].clamp(0.0, 1.0);
@@ -4108,56 +4559,6 @@ pub(crate) fn decode_image_data_to_premul_rgba_raw(
     ))
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    #[inline]
-    fn decode_char(c: u8) -> Result<u8, String> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(format!("invalid base64 character: {}", c as char)),
-        }
-    }
-
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut q = [0u8; 4];
-    let mut qlen = 0usize;
-
-    for &b in bytes {
-        if b == b'=' {
-            break;
-        }
-        if b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' {
-            continue;
-        }
-        q[qlen] = decode_char(b)?;
-        qlen += 1;
-        if qlen == 4 {
-            output.push((q[0] << 2) | (q[1] >> 4));
-            output.push((q[1] << 4) | (q[2] >> 2));
-            output.push((q[2] << 6) | q[3]);
-            qlen = 0;
-        }
-    }
-
-    match qlen {
-        0 => {}
-        2 => {
-            output.push((q[0] << 2) | (q[1] >> 4));
-        }
-        3 => {
-            output.push((q[0] << 2) | (q[1] >> 4));
-            output.push((q[1] << 4) | (q[2] >> 2));
-        }
-        _ => return Err("invalid base64 length".to_string()),
-    }
-
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4182,23 +4583,23 @@ mod tests {
             nodes: vec![SceneNode::Path {
                 segments: vec![
                     PathSegment {
-                        cmd: "M".to_string(),
+                        cmd: PathCmd::M,
                         points: vec![10.0, 10.0],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![190.0, 10.0],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![190.0, 190.0],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![10.0, 190.0],
                     },
                     PathSegment {
-                        cmd: "Z".to_string(),
+                        cmd: PathCmd::Z,
                         points: vec![],
                     },
                 ],
@@ -4208,8 +4609,8 @@ mod tests {
                 stroke: Some(StrokeStyle {
                     color: [0.0, 0.0, 0.0, 1.0],
                     width: 2.0,
-                    line_cap: String::new(),
-                    line_join: String::new(),
+                    line_cap: crate::scene::LineCap::default(),
+                    line_join: crate::scene::LineJoin::default(),
                     dash_array: vec![],
                     dash_offset: 0.0,
                 }),
@@ -4281,8 +4682,8 @@ mod tests {
                 stroke: Some(StrokeStyle {
                     color: [0.0, 0.0, 0.0, 1.0],
                     width: 1.0,
-                    line_cap: String::new(),
-                    line_join: String::new(),
+                    line_cap: crate::scene::LineCap::default(),
+                    line_join: crate::scene::LineJoin::default(),
                     dash_array: vec![],
                     dash_offset: 0.0,
                 }),

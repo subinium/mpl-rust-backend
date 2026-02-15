@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-
 import numpy as np
 from matplotlib.backend_bases import RendererBase, GraphicsContextBase
 from matplotlib.transforms import Affine2D
@@ -33,6 +31,8 @@ class RendererRust(RendererBase):
         # matplotlib already sends all coordinates in display pixels.
         self._scene = SceneBuilder(width, height, 72.0)
         self._current_clip = None  # track active clip for group management
+        # Cache y-flip transform — constant for the lifetime of this renderer.
+        self._y_flip_transform = Affine2D().scale(1, -1).translate(0, self.height)
 
     @property
     def scene_builder(self) -> SceneBuilder:
@@ -47,7 +47,7 @@ class RendererRust(RendererBase):
         affects text.  tiny_skia uses y-down (y=0 at top), so we need
         y' = height - y for all path/marker/image coordinates.
         """
-        return Affine2D().scale(1, -1).translate(0, self.height)
+        return self._y_flip_transform
 
     # ── Clip handling ─────────────────────────────────────────────
 
@@ -90,22 +90,36 @@ class RendererRust(RendererBase):
     def draw_path(self, gc, path, transform, rgbFace=None):
         self._apply_clip(gc)
         combined = transform + self._y_flip()
-        snap = self._should_snap(gc, path, combined)
         fill = gc_to_fill(gc, rgbFace)
         stroke = gc_to_stroke(gc, self)
 
         # For large paths, use binary transport to skip Python loop overhead
         n_vertices = path.vertices.shape[0] if path.vertices is not None else 0
-        if n_vertices > 50:
+        if n_vertices > 20:
             path_t = path.transformed(combined)
             verts = np.ascontiguousarray(path_t.vertices, dtype=np.float64)
             codes = path_t.codes
+
+            # Detect snap from stroke width (avoid double-transform via
+            # is_rectilinear) — only snap thin rectilinear paths.
+            snap = self._should_snap_fast(gc, codes)
+
             if codes is None:
-                # Default: MOVETO for first, LINETO for rest
+                # Pure polyline (MOVETO + N LINETO) — use PolylineData for
+                # stroke-only paths to avoid sending codes entirely.
+                if fill is None and stroke is not None:
+                    pts = np.ascontiguousarray(verts, dtype=np.float32)
+                    self._scene.add_polyline_data(
+                        pts.tobytes(),
+                        len(verts),
+                        stroke=stroke,
+                    )
+                    return
                 codes = np.full(len(verts), 2, dtype=np.uint8)
                 codes[0] = 1
             else:
                 codes = np.ascontiguousarray(codes, dtype=np.uint8)
+
             self._scene.add_path_data(
                 verts.tobytes(),
                 codes.tobytes(),
@@ -115,6 +129,7 @@ class RendererRust(RendererBase):
                 stroke=stroke,
             )
         else:
+            snap = self._should_snap(gc, path, combined)
             segments = path_to_segments(path, combined, snap=snap)
             if not segments:
                 return
@@ -137,6 +152,30 @@ class RendererRust(RendererBase):
             return False
         return is_rectilinear(path, combined_transform)
 
+    def _should_snap_fast(self, gc, codes):
+        """Fast snap check for binary-transport paths (already transformed).
+
+        Avoids the expensive is_rectilinear re-transform by checking codes
+        directly — rectilinear paths have only MOVETO(1), LINETO(2),
+        CLOSEPOLY(79) codes.
+        """
+        snap = gc.get_snap()
+        if snap is False:
+            return False
+        if snap is True:
+            return True
+        lw_px = gc.get_linewidth() * self.dpi / 72.0
+        if lw_px > 1.5:
+            return False
+        if codes is None:
+            # Pure MOVETO+LINETO polyline — always rectilinear-eligible
+            # but we don't know without checking vertices.  Skip snap for
+            # large polylines (they are rarely axis lines).
+            return False
+        # Check if codes contain only M/L/Z (rectilinear candidates)
+        mask = (codes == 1) | (codes == 2) | (codes == 79) | (codes == 0)
+        return bool(mask.all())
+
     def draw_markers(self, gc, marker_path, marker_trans, path, trans, rgbFace=None):
         self._apply_clip(gc)
         # Apply marker_trans (encodes size + direction) then y-flip for
@@ -151,17 +190,25 @@ class RendererRust(RendererBase):
             return
 
         # Extract marker positions with y-flip applied.
-        # Agg snaps marker positions to integer pixels via floor(x + 0.5),
-        # which is equivalent to round().  This ensures every marker has
-        # identical AA coverage values (rasterize-once-stamp-many pattern).
+        # Vectorized numpy path: transform vertices directly, avoiding the
+        # expensive Python-level iter_segments loop.
         flip = self._y_flip()
-        _rnd = round
-        positions = []
-        for points, code in path.iter_segments(trans + flip, simplify=False):
-            if len(points) >= 2:
-                positions.append((_rnd(float(points[0])), _rnd(float(points[1]))))
+        combined_trans = trans + flip
+        path_t = path.transformed(combined_trans)
+        verts = path_t.vertices
+        if verts is None or len(verts) == 0:
+            return
 
-        if not positions:
+        # Agg snaps marker positions to integer pixels via floor(x + 0.5),
+        # which is equivalent to round().  Round in numpy for all positions.
+        positions = np.round(verts).astype(np.float64)
+
+        # Filter out degenerate positions (NaN/Inf)
+        finite_mask = np.isfinite(positions).all(axis=1)
+        if not finite_mask.all():
+            positions = positions[finite_mask]
+
+        if len(positions) == 0:
             return
 
         fill = gc_to_fill(gc, rgbFace)

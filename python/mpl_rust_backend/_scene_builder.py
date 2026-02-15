@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import struct
 
+import numpy as np
+
 try:
     import orjson as _json_mod
 
@@ -15,6 +17,9 @@ except ImportError:
 
     def _dumps(obj: dict) -> bytes:
         return _json_mod.dumps(obj, separators=(",", ":")).encode("utf-8")
+
+
+_IDENTITY = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
 
 
 class SceneBuilder:
@@ -43,7 +48,7 @@ class SceneBuilder:
         self._group_stack[-1].append(
             {
                 "type": "group",
-                "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                "transform": transform or _IDENTITY,
                 "alpha": alpha,
                 "clip": clip,
                 "children": self._nodes,
@@ -59,7 +64,7 @@ class SceneBuilder:
         node = {
             "type": "path",
             "segments": segments,
-            "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "transform": transform or _IDENTITY,
         }
         if fill is not None:
             node["fill"] = fill
@@ -93,7 +98,7 @@ class SceneBuilder:
             "rotation": rotation,
             "ha": ha,
             "va": va,
-            "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "transform": transform or _IDENTITY,
         }
         self._nodes.append(node)
 
@@ -109,10 +114,11 @@ class SceneBuilder:
     ):
         """Add markers.
 
-        For large position arrays (>100 points), uses MarkersData with a binary blob
-        for zero-copy transport.
+        For large position arrays (>30 points), uses MarkersData with a binary blob
+        for zero-copy transport.  Accepts numpy arrays or lists of tuples.
         """
-        if len(positions) > 100:
+        n = len(positions)
+        if n > 30:
             self._add_markers_data(
                 marker_segments,
                 positions,
@@ -128,7 +134,7 @@ class SceneBuilder:
                 "path": marker_segments,
                 "positions": [[float(p[0]), float(p[1])] for p in positions],
                 "size": float(size),
-                "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                "transform": transform or _IDENTITY,
             }
             if fill is not None:
                 node["fill"] = fill
@@ -148,9 +154,10 @@ class SceneBuilder:
         positions_transform,
         transform,
     ):
-        import numpy as np
-
-        pos_array = np.asarray(positions, dtype=np.float32)
+        pos_array = np.ascontiguousarray(
+            positions if isinstance(positions, np.ndarray) else positions,
+            dtype=np.float32,
+        )
         blob_data = pos_array.tobytes()
         blob_idx = len(self._blobs)
         self._blobs.append(blob_data)
@@ -162,7 +169,7 @@ class SceneBuilder:
             "positions_dtype": "f32",
             "count": len(positions),
             "size": float(size),
-            "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "transform": transform or _IDENTITY,
         }
         if fill is not None:
             node["fill"] = fill
@@ -194,10 +201,31 @@ class SceneBuilder:
             "codes_blob": cblob,
             "count": count,
             "snap": snap,
-            "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            "transform": transform or _IDENTITY,
         }
         if fill is not None:
             node["fill"] = fill
+        if stroke is not None:
+            node["stroke"] = stroke
+        self._nodes.append(node)
+
+    def add_polyline_data(
+        self,
+        points_bytes,
+        count,
+        stroke=None,
+        transform=None,
+    ):
+        """Add a stroke-only polyline using binary XY blob (no codes needed)."""
+        blob_idx = len(self._blobs)
+        self._blobs.append(points_bytes)
+        node = {
+            "type": "polyline_data",
+            "points_blob": blob_idx,
+            "points_dtype": "f32",
+            "count": count,
+            "transform": transform or _IDENTITY,
+        }
         if stroke is not None:
             node["stroke"] = stroke
         self._nodes.append(node)
@@ -214,20 +242,7 @@ class SceneBuilder:
                 "y": y,
                 "width": width,
                 "height": height,
-                "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            }
-        )
-
-    def add_image(self, data_b64, x, y, width, height, transform=None):
-        self._nodes.append(
-            {
-                "type": "image",
-                "data": data_b64,
-                "x": x,
-                "y": y,
-                "width": width,
-                "height": height,
-                "transform": transform or [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                "transform": transform or _IDENTITY,
             }
         )
 
@@ -245,7 +260,7 @@ class SceneBuilder:
             "nodes": self._nodes,
         }
         json_bytes = _dumps(scene)
-        return json_bytes, list(self._blobs)
+        return json_bytes, self._blobs
 
     def build_packet(self) -> bytes:
         """Serialize into a single PXPK packet (JSON + blobs)."""

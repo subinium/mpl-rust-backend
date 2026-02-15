@@ -264,9 +264,23 @@ fn default_font_size() -> f64 {
     10.0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PathCmd {
+    #[serde(rename = "M")]
+    M,
+    #[serde(rename = "L")]
+    L,
+    #[serde(rename = "C")]
+    C,
+    #[serde(rename = "Q")]
+    Q,
+    #[serde(rename = "Z")]
+    Z,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathSegment {
-    pub cmd: String, // "M", "L", "C", "Q", "Z"
+    pub cmd: PathCmd,
     #[serde(default)]
     pub points: Vec<f64>,
 }
@@ -276,14 +290,42 @@ pub struct FillStyle {
     pub color: [f64; 4],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineCap {
+    #[serde(rename = "butt")]
+    Butt,
+    #[serde(rename = "round")]
+    Round,
+    #[serde(rename = "square")]
+    Square,
+}
+
+impl Default for LineCap {
+    fn default() -> Self { LineCap::Butt }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineJoin {
+    #[serde(rename = "miter")]
+    Miter,
+    #[serde(rename = "round")]
+    Round,
+    #[serde(rename = "bevel")]
+    Bevel,
+}
+
+impl Default for LineJoin {
+    fn default() -> Self { LineJoin::Miter }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrokeStyle {
     pub color: [f64; 4],
     pub width: f64,
     #[serde(default)]
-    pub line_cap: String,
+    pub line_cap: LineCap,
     #[serde(default)]
-    pub line_join: String,
+    pub line_join: LineJoin,
     #[serde(default)]
     pub dash_array: Vec<f64>,
     #[serde(default)]

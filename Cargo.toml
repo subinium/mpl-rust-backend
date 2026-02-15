@@ -6,3 +6,8 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

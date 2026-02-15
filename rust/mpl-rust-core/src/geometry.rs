@@ -1,6 +1,6 @@
 use tiny_skia::PathBuilder;
 
-use crate::scene::{ClipRect, PathSegment};
+use crate::scene::{ClipRect, PathCmd, PathSegment};
 
 /// Convert a sequence of `PathSegment` commands into a `tiny_skia::Path`.
 ///
@@ -9,18 +9,18 @@ pub fn segments_to_path(segments: &[PathSegment]) -> Option<tiny_skia::Path> {
     let mut pb = PathBuilder::new();
 
     for seg in segments {
-        match seg.cmd.as_str() {
-            "M" => {
+        match seg.cmd {
+            PathCmd::M => {
                 if seg.points.len() >= 2 {
                     pb.move_to(seg.points[0] as f32, seg.points[1] as f32);
                 }
             }
-            "L" => {
+            PathCmd::L => {
                 if seg.points.len() >= 2 {
                     pb.line_to(seg.points[0] as f32, seg.points[1] as f32);
                 }
             }
-            "C" => {
+            PathCmd::C => {
                 if seg.points.len() >= 6 {
                     pb.cubic_to(
                         seg.points[0] as f32,
@@ -32,7 +32,7 @@ pub fn segments_to_path(segments: &[PathSegment]) -> Option<tiny_skia::Path> {
                     );
                 }
             }
-            "Q" => {
+            PathCmd::Q => {
                 if seg.points.len() >= 4 {
                     pb.quad_to(
                         seg.points[0] as f32,
@@ -42,11 +42,8 @@ pub fn segments_to_path(segments: &[PathSegment]) -> Option<tiny_skia::Path> {
                     );
                 }
             }
-            "Z" => {
+            PathCmd::Z => {
                 pb.close();
-            }
-            _ => {
-                // Unknown command — skip
             }
         }
     }
@@ -316,19 +313,19 @@ mod tests {
     fn test_segments_to_path_basic() {
         let segments = vec![
             PathSegment {
-                cmd: "M".to_string(),
+                cmd: PathCmd::M,
                 points: vec![0.0, 0.0],
             },
             PathSegment {
-                cmd: "L".to_string(),
+                cmd: PathCmd::L,
                 points: vec![100.0, 0.0],
             },
             PathSegment {
-                cmd: "L".to_string(),
+                cmd: PathCmd::L,
                 points: vec![100.0, 100.0],
             },
             PathSegment {
-                cmd: "Z".to_string(),
+                cmd: PathCmd::Z,
                 points: vec![],
             },
         ];

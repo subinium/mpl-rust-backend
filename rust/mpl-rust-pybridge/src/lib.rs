@@ -82,8 +82,7 @@ fn render_scene_bytes(
     let format_owned = format.to_string();
 
     let result = py.allow_threads(move || -> Result<Vec<u8>, String> {
-        let scene: mpl_rust_core::scene::Scene = serde_json::from_slice(scene_json.as_ref())
-            .map_err(|e| format!("Invalid scene JSON: {}", e))?;
+        let scene = mpl_rust_core::parse_scene(scene_json.as_ref())?;
 
         match format_owned.as_str() {
             "png" => Ok(mpl_rust_core::render::rasterizer::render_to_png(&scene)),
@@ -109,8 +108,7 @@ fn render_scene_with_blobs(
     let format_owned = format.to_string();
 
     let result = py.allow_threads(move || -> Result<Vec<u8>, String> {
-        let scene: mpl_rust_core::scene::Scene = serde_json::from_slice(scene_json.as_ref())
-            .map_err(|e| format!("Invalid scene JSON: {}", e))?;
+        let scene = mpl_rust_core::parse_scene(scene_json.as_ref())?;
         let blob_slices: Vec<&[u8]> = blobs.iter().map(|b| b.as_ref()).collect();
 
         match format_owned.as_str() {
@@ -146,8 +144,7 @@ fn render_scene_packet(
         let packet_view = parse_scene_packet(packet)
             .map_err(|e| format!("Invalid scene packet: {}", e))?;
         let scene_json = &packet[packet_view.json_start..packet_view.json_end];
-        let scene: mpl_rust_core::scene::Scene = serde_json::from_slice(scene_json)
-            .map_err(|e| format!("Invalid scene JSON in packet: {}", e))?;
+        let scene = mpl_rust_core::parse_scene(scene_json)?;
         let blobs: Vec<&[u8]> = packet_view
             .blob_ranges
             .iter()

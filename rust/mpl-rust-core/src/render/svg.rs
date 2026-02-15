@@ -1,10 +1,13 @@
 use crate::render::rasterizer::{
     decode_image_data_to_premul_rgba, decode_image_data_to_premul_rgba_raw,
 };
-use crate::scene::{PathSegment, Scene, SceneNode, StrokeStyle};
+use crate::scene::{LineCap, LineJoin, PathCmd, PathSegment, Scene, SceneNode, StrokeStyle};
 use std::env;
 use std::fmt::Write;
 use tiny_skia::Pixmap;
+
+use super::base64::{base64_decode, base64_encode};
+use super::dtype::{normalized_dtype, normalized_index_dtype, normalized_color_dtype};
 
 /// Render a scene graph to an SVG string (returned as UTF-8 bytes).
 pub fn render_to_svg(scene: &Scene) -> Vec<u8> {
@@ -872,8 +875,8 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
     }
     let mut d = String::new();
     for seg in segments {
-        match seg.cmd.as_str() {
-            "M" if seg.points.len() >= 2 => {
+        match seg.cmd {
+            PathCmd::M if seg.points.len() >= 2 => {
                 write!(
                     d,
                     "M{:.2},{:.2} ",
@@ -882,7 +885,7 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
                 )
                 .unwrap();
             }
-            "L" if seg.points.len() >= 2 => {
+            PathCmd::L if seg.points.len() >= 2 => {
                 write!(
                     d,
                     "L{:.2},{:.2} ",
@@ -891,7 +894,7 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
                 )
                 .unwrap();
             }
-            "C" if seg.points.len() >= 6 => {
+            PathCmd::C if seg.points.len() >= 6 => {
                 write!(
                     d,
                     "C{:.2},{:.2} {:.2},{:.2} {:.2},{:.2} ",
@@ -904,7 +907,7 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
                 )
                 .unwrap();
             }
-            "Q" if seg.points.len() >= 4 => {
+            PathCmd::Q if seg.points.len() >= 4 => {
                 write!(
                     d,
                     "Q{:.2},{:.2} {:.2},{:.2} ",
@@ -915,7 +918,7 @@ fn segments_to_svg_path_with_scale(segments: &[PathSegment], scale: f64) -> Stri
                 )
                 .unwrap();
             }
-            "Z" => {
+            PathCmd::Z => {
                 d.push_str("Z ");
             }
             _ => {}
@@ -1124,38 +1127,7 @@ fn svg_image_rendering(interpolation: &str) -> Option<&'static str> {
     }
 }
 
-fn normalized_point_dtype(dtype: &str) -> &'static str {
-    let d = dtype.to_ascii_lowercase();
-    if d == "f64" || d.contains("float64") || d.contains("f8") {
-        "f64"
-    } else if d == "f32" || d.contains("float32") || d.contains("f4") {
-        "f32"
-    } else {
-        "unknown"
-    }
-}
 
-fn normalized_index_dtype(dtype: &str) -> &'static str {
-    let d = dtype.to_ascii_lowercase();
-    if d == "u64" || d.contains("uint64") || d.contains("u8") {
-        "u64"
-    } else if d == "u32" || d.contains("uint32") || d.contains("u4") {
-        "u32"
-    } else {
-        "unknown"
-    }
-}
-
-fn normalized_color_dtype(dtype: &str) -> &'static str {
-    let d = dtype.to_ascii_lowercase();
-    if d == "f64" || d.contains("float64") || d.contains("f8") {
-        "f64"
-    } else if d == "f32" || d.contains("float32") || d.contains("f4") {
-        "f32"
-    } else {
-        "unknown"
-    }
-}
 
 fn write_marker_uses_from_raw(
     svg: &mut String,
@@ -1168,7 +1140,7 @@ fn write_marker_uses_from_raw(
     precision: usize,
     compact_uses: bool,
 ) -> Result<(), String> {
-    match normalized_point_dtype(dtype) {
+    match normalized_dtype(dtype) {
         "f32" => {
             let expected = count
                 .checked_mul(2)
@@ -1236,7 +1208,7 @@ fn write_polyline_path_from_raw(
     }
     let mut started = false;
     let mut in_line_cmd = false;
-    match normalized_point_dtype(dtype) {
+    match normalized_dtype(dtype) {
         "f32" => {
             let expected = count
                 .checked_mul(2)
@@ -1347,7 +1319,7 @@ fn decode_polyline_points_raw(
         return Ok(Vec::new());
     }
     let mut points = Vec::with_capacity(count);
-    match normalized_point_dtype(dtype) {
+    match normalized_dtype(dtype) {
         "f32" => {
             let expected = count
                 .checked_mul(2)
@@ -1888,78 +1860,6 @@ fn svg_polyline_coord_precision_auto(count: usize) -> usize {
     }
 }
 
-fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    #[inline]
-    fn decode_char(c: u8) -> Result<u8, String> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(format!("invalid base64 character: {}", c as char)),
-        }
-    }
-
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut q = [0u8; 4];
-    let mut qlen = 0usize;
-
-    for &b in bytes {
-        if b == b'=' {
-            break;
-        }
-        if b == b'\n' || b == b'\r' || b == b' ' || b == b'\t' {
-            continue;
-        }
-        q[qlen] = decode_char(b)?;
-        qlen += 1;
-        if qlen == 4 {
-            output.push((q[0] << 2) | (q[1] >> 4));
-            output.push((q[1] << 4) | (q[2] >> 2));
-            output.push((q[2] << 6) | q[3]);
-            qlen = 0;
-        }
-    }
-
-    match qlen {
-        0 => {}
-        2 => output.push((q[0] << 2) | (q[1] >> 4)),
-        3 => {
-            output.push((q[0] << 2) | (q[1] >> 4));
-            output.push((q[1] << 4) | (q[2] >> 2));
-        }
-        _ => return Err("invalid base64 length".to_string()),
-    }
-
-    Ok(output)
-}
-
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[((b0 & 0b0000_0011) << 4 | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[((b1 & 0b0000_1111) << 2 | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
 fn write_stroke_attrs(svg: &mut String, style: &StrokeStyle) {
     write!(
         svg,
@@ -1971,11 +1871,15 @@ fn write_stroke_attrs(svg: &mut String, style: &StrokeStyle) {
     if style.color[3] < 1.0 {
         write!(svg, r#" stroke-opacity="{:.3}""#, style.color[3]).unwrap();
     }
-    if !style.line_cap.is_empty() {
-        write!(svg, r#" stroke-linecap="{}""#, style.line_cap).unwrap();
+    match style.line_cap {
+        LineCap::Butt => {} // SVG default, omit
+        LineCap::Round => { write!(svg, r#" stroke-linecap="round""#).unwrap(); }
+        LineCap::Square => { write!(svg, r#" stroke-linecap="square""#).unwrap(); }
     }
-    if !style.line_join.is_empty() {
-        write!(svg, r#" stroke-linejoin="{}""#, style.line_join).unwrap();
+    match style.line_join {
+        LineJoin::Miter => {} // SVG default, omit
+        LineJoin::Round => { write!(svg, r#" stroke-linejoin="round""#).unwrap(); }
+        LineJoin::Bevel => { write!(svg, r#" stroke-linejoin="bevel""#).unwrap(); }
     }
     if !style.dash_array.is_empty() {
         let dash_str: Vec<String> = style
@@ -2039,19 +1943,19 @@ mod tests {
             nodes: vec![SceneNode::Path {
                 segments: vec![
                     PathSegment {
-                        cmd: "M".to_string(),
+                        cmd: PathCmd::M,
                         points: vec![10.0, 10.0],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![190.0, 10.0],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![190.0, 190.0],
                     },
                     PathSegment {
-                        cmd: "Z".to_string(),
+                        cmd: PathCmd::Z,
                         points: vec![],
                     },
                 ],
@@ -2061,8 +1965,8 @@ mod tests {
                 stroke: Some(StrokeStyle {
                     color: [0.0, 0.0, 0.0, 1.0],
                     width: 2.0,
-                    line_cap: String::new(),
-                    line_join: String::new(),
+                    line_cap: LineCap::default(),
+                    line_join: LineJoin::default(),
                     dash_array: vec![],
                     dash_offset: 0.0,
                 }),
@@ -2113,23 +2017,23 @@ mod tests {
             nodes: vec![SceneNode::Markers {
                 path: vec![
                     PathSegment {
-                        cmd: "M".to_string(),
+                        cmd: PathCmd::M,
                         points: vec![-0.5, -0.5],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![0.5, -0.5],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![0.5, 0.5],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![-0.5, 0.5],
                     },
                     PathSegment {
-                        cmd: "Z".to_string(),
+                        cmd: PathCmd::Z,
                         points: vec![],
                     },
                 ],
@@ -2167,23 +2071,23 @@ mod tests {
             nodes: vec![SceneNode::MarkersData {
                 path: vec![
                     PathSegment {
-                        cmd: "M".to_string(),
+                        cmd: PathCmd::M,
                         points: vec![-0.5, -0.5],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![0.5, -0.5],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![0.5, 0.5],
                     },
                     PathSegment {
-                        cmd: "L".to_string(),
+                        cmd: PathCmd::L,
                         points: vec![-0.5, 0.5],
                     },
                     PathSegment {
-                        cmd: "Z".to_string(),
+                        cmd: PathCmd::Z,
                         points: vec![],
                     },
                 ],
@@ -2227,8 +2131,8 @@ mod tests {
                 stroke: Some(StrokeStyle {
                     color: [0.1, 0.2, 0.3, 1.0],
                     width: 1.2,
-                    line_cap: String::new(),
-                    line_join: String::new(),
+                    line_cap: LineCap::default(),
+                    line_join: LineJoin::default(),
                     dash_array: vec![],
                     dash_offset: 0.0,
                 }),
@@ -2356,8 +2260,8 @@ mod tests {
                 stroke: Some(StrokeStyle {
                     color: [0.0, 0.0, 0.0, 1.0],
                     width: 1.0,
-                    line_cap: String::new(),
-                    line_join: String::new(),
+                    line_cap: LineCap::default(),
+                    line_join: LineJoin::default(),
                     dash_array: vec![],
                     dash_offset: 0.0,
                 }),
