@@ -89,6 +89,12 @@ pub enum SceneNode {
         positions_transform: Option<[f64; 6]>,
         #[serde(default = "default_transform")]
         transform: [f64; 6],
+        #[serde(default)]
+        fill_colors_data: Option<String>, // base64 encoded per-marker RGBA
+        #[serde(default)]
+        fill_colors_blob: Option<usize>, // raw per-marker RGBA blob index
+        #[serde(default = "default_color_dtype")]
+        fill_colors_dtype: String, // "f32"
     },
     #[serde(rename = "polyline_data")]
     PolylineData {

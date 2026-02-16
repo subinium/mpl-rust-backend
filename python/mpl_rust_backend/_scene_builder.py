@@ -179,6 +179,48 @@ class SceneBuilder:
             node["positions_transform"] = positions_transform
         self._nodes.append(node)
 
+    def add_markers_data_colored(
+        self,
+        marker_segments,
+        positions,
+        size,
+        fill_colors,
+        stroke=None,
+        positions_transform=None,
+        transform=None,
+    ):
+        """Add markers with per-point fill colors (binary blob transport)."""
+        pos_array = np.ascontiguousarray(
+            positions if isinstance(positions, np.ndarray) else positions,
+            dtype=np.float32,
+        )
+        colors_array = np.ascontiguousarray(
+            fill_colors if isinstance(fill_colors, np.ndarray) else fill_colors,
+            dtype=np.float32,
+        )
+
+        pos_blob = len(self._blobs)
+        self._blobs.append(pos_array.tobytes())
+        colors_blob = len(self._blobs)
+        self._blobs.append(colors_array.tobytes())
+
+        node = {
+            "type": "markers_data",
+            "path": marker_segments,
+            "positions_blob": pos_blob,
+            "positions_dtype": "f32",
+            "count": len(positions),
+            "size": float(size),
+            "fill_colors_blob": colors_blob,
+            "fill_colors_dtype": "f32",
+            "transform": transform or _IDENTITY,
+        }
+        if stroke is not None:
+            node["stroke"] = stroke
+        if positions_transform is not None:
+            node["positions_transform"] = positions_transform
+        self._nodes.append(node)
+
     def add_path_data(
         self,
         vertices_bytes,

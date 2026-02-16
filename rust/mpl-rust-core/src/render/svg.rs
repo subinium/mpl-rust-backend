@@ -302,7 +302,9 @@ fn render_svg_node(
             stroke,
             positions_transform,
             transform,
-            ..
+            fill_colors_data,
+            fill_colors_blob,
+            fill_colors_dtype,
         } => {
             let raw_owned = if positions_blob.is_some() {
                 None
@@ -338,17 +340,39 @@ fn render_svg_node(
             }
             let marker_id = format!("marker_{}", next_svg_id(id_counter));
 
+            // Resolve per-point fill colors (if present).
+            let fill_colors_raw_owned = if fill_colors_blob.is_some() {
+                None
+            } else {
+                fill_colors_data
+                    .as_ref()
+                    .and_then(|s| base64_decode(s).ok())
+            };
+            let fill_colors_raw: Option<&[u8]> = if let Some(blob_idx) = fill_colors_blob {
+                blobs
+                    .and_then(|all| all.get(*blob_idx))
+                    .copied()
+            } else {
+                fill_colors_raw_owned.as_deref()
+            };
+            let per_point_colors: Option<Vec<[f64; 4]>> = fill_colors_raw.and_then(|raw_bytes| {
+                decode_polygon_fill_colors_raw(raw_bytes, fill_colors_dtype, *count).ok()
+            });
+
             write!(svg, "{pad}<g").unwrap();
             if !is_identity_transform(transform) {
                 write_svg_transform_attr(svg, transform);
             }
-            if let Some(fill_style) = fill {
-                write!(svg, r#" fill="{}""#, rgba_to_svg_color(&fill_style.color)).unwrap();
-                if fill_style.color[3] < 1.0 {
-                    write!(svg, r#" fill-opacity="{:.3}""#, fill_style.color[3]).unwrap();
+            // Only set group-level fill when no per-point colors.
+            if per_point_colors.is_none() {
+                if let Some(fill_style) = fill {
+                    write!(svg, r#" fill="{}""#, rgba_to_svg_color(&fill_style.color)).unwrap();
+                    if fill_style.color[3] < 1.0 {
+                        write!(svg, r#" fill-opacity="{:.3}""#, fill_style.color[3]).unwrap();
+                    }
+                } else {
+                    svg.push_str(r#" fill="none""#);
                 }
-            } else {
-                svg.push_str(r#" fill="none""#);
             }
             if let Some(stroke_style) = stroke {
                 write_stroke_attrs(svg, stroke_style);
@@ -361,28 +385,48 @@ fn render_svg_node(
             )
             .unwrap();
             svg.push('\n');
-            let marker_precision = svg_marker_position_precision(*count);
-            let compact_uses = svg_marker_compact_uses(*count);
-            let per_use_hint = if compact_uses { 26 } else { 34 };
-            svg.reserve(count.saturating_mul(per_use_hint));
-            if write_marker_uses_from_raw(
-                svg,
-                &pad,
-                &marker_id,
-                raw,
-                positions_dtype,
-                *count,
-                positions_transform.as_ref(),
-                marker_precision,
-                compact_uses,
-            )
-            .is_err()
-            {
-                write!(svg, "{pad}</g>\n").unwrap();
-                return;
-            }
-            if compact_uses {
-                svg.push('\n');
+
+            if let Some(ref colors) = per_point_colors {
+                // Per-point colors: emit individual <use> with per-marker fill.
+                if write_marker_uses_colored_from_raw(
+                    svg,
+                    &pad,
+                    &marker_id,
+                    raw,
+                    positions_dtype,
+                    *count,
+                    positions_transform.as_ref(),
+                    colors,
+                )
+                .is_err()
+                {
+                    write!(svg, "{pad}</g>\n").unwrap();
+                    return;
+                }
+            } else {
+                let marker_precision = svg_marker_position_precision(*count);
+                let compact_uses = svg_marker_compact_uses(*count);
+                let per_use_hint = if compact_uses { 26 } else { 34 };
+                svg.reserve(count.saturating_mul(per_use_hint));
+                if write_marker_uses_from_raw(
+                    svg,
+                    &pad,
+                    &marker_id,
+                    raw,
+                    positions_dtype,
+                    *count,
+                    positions_transform.as_ref(),
+                    marker_precision,
+                    compact_uses,
+                )
+                .is_err()
+                {
+                    write!(svg, "{pad}</g>\n").unwrap();
+                    return;
+                }
+                if compact_uses {
+                    svg.push('\n');
+                }
             }
 
             write!(svg, "{pad}</g>\n").unwrap();
@@ -1165,6 +1209,86 @@ fn write_marker_uses_from_raw(
                     positions_transform,
                 );
                 write_marker_use(svg, pad, marker_id, px, py, precision, compact_uses);
+            }
+        }
+        other => return Err(format!("unsupported markers_data dtype: {}", other)),
+    }
+    Ok(())
+}
+
+fn write_marker_uses_colored_from_raw(
+    svg: &mut String,
+    pad: &str,
+    marker_id: &str,
+    raw: &[u8],
+    dtype: &str,
+    count: usize,
+    positions_transform: Option<&[f64; 6]>,
+    colors: &[[f64; 4]],
+) -> Result<(), String> {
+    match normalized_dtype(dtype) {
+        "f32" => {
+            let expected = count
+                .checked_mul(2)
+                .and_then(|n| n.checked_mul(4))
+                .ok_or_else(|| "markers_data byte-size overflow".to_string())?;
+            if raw.len() != expected {
+                return Err(format!(
+                    "markers_data byte-size mismatch: expected {}, got {}",
+                    expected,
+                    raw.len()
+                ));
+            }
+            for (i, chunk) in raw.chunks_exact(8).enumerate() {
+                let mut bx = [0u8; 4];
+                let mut by = [0u8; 4];
+                bx.copy_from_slice(&chunk[0..4]);
+                by.copy_from_slice(&chunk[4..8]);
+                let (px, py) = apply_affine_2d(
+                    f32::from_le_bytes(bx) as f64,
+                    f32::from_le_bytes(by) as f64,
+                    positions_transform,
+                );
+                write!(svg, "{pad}  <use href='#{marker_id}' x='{px:.2}' y='{py:.2}'").unwrap();
+                if let Some(color) = colors.get(i) {
+                    write!(svg, " fill='{}'", rgba_to_svg_color(color)).unwrap();
+                    if color[3] < 1.0 {
+                        write!(svg, " fill-opacity='{:.3}'", color[3]).unwrap();
+                    }
+                }
+                svg.push_str("/>\n");
+            }
+        }
+        "f64" => {
+            let expected = count
+                .checked_mul(2)
+                .and_then(|n| n.checked_mul(8))
+                .ok_or_else(|| "markers_data byte-size overflow".to_string())?;
+            if raw.len() != expected {
+                return Err(format!(
+                    "markers_data byte-size mismatch: expected {}, got {}",
+                    expected,
+                    raw.len()
+                ));
+            }
+            for (i, chunk) in raw.chunks_exact(16).enumerate() {
+                let mut bx = [0u8; 8];
+                let mut by = [0u8; 8];
+                bx.copy_from_slice(&chunk[0..8]);
+                by.copy_from_slice(&chunk[8..16]);
+                let (px, py) = apply_affine_2d(
+                    f64::from_le_bytes(bx),
+                    f64::from_le_bytes(by),
+                    positions_transform,
+                );
+                write!(svg, "{pad}  <use href='#{marker_id}' x='{px:.2}' y='{py:.2}'").unwrap();
+                if let Some(color) = colors.get(i) {
+                    write!(svg, " fill='{}'", rgba_to_svg_color(color)).unwrap();
+                    if color[3] < 1.0 {
+                        write!(svg, " fill-opacity='{:.3}'", color[3]).unwrap();
+                    }
+                }
+                svg.push_str("/>\n");
             }
         }
         other => return Err(format!("unsupported markers_data dtype: {}", other)),
@@ -2078,6 +2202,9 @@ mod tests {
                 stroke: None,
                 positions_transform: None,
                 transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                fill_colors_data: None,
+                fill_colors_blob: None,
+                fill_colors_dtype: "f32".to_string(),
             }],
         };
         let svg = render_to_svg_with_blobs(&scene, &blob_refs);

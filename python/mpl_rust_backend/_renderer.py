@@ -253,6 +253,155 @@ class RendererRust(RendererBase):
                     can_batch = False
                     break
         if not can_batch:
+            # Markers fallback: single curved-path template with per-point colors.
+            # This handles scatter with circle markers (CURVE4 codes) efficiently
+            # by packing into a single MarkersData node instead of N draw_path calls.
+            n_offsets = len(offsets)
+            has_dashes = any(
+                ls_dashes is not None and len(ls_dashes) > 0
+                for _, ls_dashes in linestyles
+            )
+            if (
+                len(paths) == 1
+                and not has_dashes
+                and len(facecolors) > 0
+                and n_offsets > 10
+            ):
+                # Check all_transforms are uniform (same shape for all markers)
+                if len(all_transforms) > 1:
+                    ref_t = all_transforms[0]
+                    all_same = all(
+                        np.allclose(t, ref_t, atol=1e-6) for t in all_transforms[1:]
+                    )
+                    if not all_same:
+                        return super().draw_path_collection(
+                            gc,
+                            master_transform,
+                            paths,
+                            all_transforms,
+                            offsets,
+                            offset_trans,
+                            facecolors,
+                            edgecolors,
+                            linewidths,
+                            linestyles,
+                            antialiaseds,
+                            urls,
+                            offset_position,
+                        )
+
+                self._apply_clip(gc)
+                y_flip = self._y_flip()
+
+                # Build marker shape in display y-down space
+                template_path = paths[0]
+                if len(all_transforms) > 0:
+                    t = Affine2D(all_transforms[0])
+                    marker_combined = t + master_transform + Affine2D().scale(1, -1)
+                else:
+                    marker_combined = master_transform + Affine2D().scale(1, -1)
+
+                marker_segments = path_to_segments(template_path, marker_combined)
+                if not marker_segments:
+                    return super().draw_path_collection(
+                        gc,
+                        master_transform,
+                        paths,
+                        all_transforms,
+                        offsets,
+                        offset_trans,
+                        facecolors,
+                        edgecolors,
+                        linewidths,
+                        linestyles,
+                        antialiaseds,
+                        urls,
+                        offset_position,
+                    )
+
+                # Compute display positions with y-flip
+                display_offsets = offset_trans.transform(np.asarray(offsets))
+                positions = display_offsets.copy()
+                positions[:, 1] = self.height - positions[:, 1]
+                positions = np.round(positions).astype(np.float32)
+
+                # Build per-point colors
+                n_facecolors = len(facecolors)
+                forced_alpha = gc.get_alpha() if gc.get_forced_alpha() else None
+                N = max(
+                    len(all_transforms) if len(all_transforms) > 0 else 1,
+                    n_offsets,
+                )
+
+                fill_colors = np.empty((N, 4), dtype=np.float32)
+                for i in range(N):
+                    fc = facecolors[i % n_facecolors]
+                    if forced_alpha is not None:
+                        fill_colors[i] = [
+                            float(fc[0]),
+                            float(fc[1]),
+                            float(fc[2]),
+                            float(forced_alpha),
+                        ]
+                    else:
+                        fill_colors[i] = [
+                            float(fc[0]),
+                            float(fc[1]),
+                            float(fc[2]),
+                            float(fc[3]) if len(fc) > 3 else 1.0,
+                        ]
+
+                # Build stroke from first edgecolor
+                stroke = None
+                if len(edgecolors) > 0:
+                    ec = edgecolors[0]
+                    lw = linewidths[0] if len(linewidths) > 0 else 0.0
+                    if lw > 0:
+                        alpha = (
+                            forced_alpha
+                            if forced_alpha is not None
+                            else (float(ec[3]) if len(ec) > 3 else 1.0)
+                        )
+                        pt2px = self.dpi / 72.0
+                        cap = gc.get_capstyle()
+                        if hasattr(cap, "name"):
+                            cap = cap.name
+                        cap = {
+                            "butt": "butt",
+                            "round": "round",
+                            "projecting": "square",
+                        }.get(str(cap), "butt")
+                        join = gc.get_joinstyle()
+                        if hasattr(join, "name"):
+                            join = join.name
+                        join = {
+                            "miter": "miter",
+                            "round": "round",
+                            "bevel": "bevel",
+                        }.get(str(join), "miter")
+                        stroke = {
+                            "color": [
+                                float(ec[0]),
+                                float(ec[1]),
+                                float(ec[2]),
+                                float(alpha),
+                            ],
+                            "width": float(lw * pt2px),
+                            "line_cap": cap,
+                            "line_join": join,
+                            "dash_array": [],
+                            "dash_offset": 0.0,
+                        }
+
+                self._scene.add_markers_data_colored(
+                    marker_segments,
+                    positions[:N],
+                    1.0,
+                    fill_colors,
+                    stroke=stroke,
+                )
+                return
+
             return super().draw_path_collection(
                 gc,
                 master_transform,

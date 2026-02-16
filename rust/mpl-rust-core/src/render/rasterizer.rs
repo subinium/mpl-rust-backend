@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use std::thread;
 
 use png::{BitDepth, ColorType, Compression, FilterType};
-use tiny_skia::{Color, FillRule, LineCap, LineJoin, Paint, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, FillRule, LineCap, LineJoin, Mask, Paint, Pixmap, Stroke, Transform};
 
 use crate::color::Colormap;
 use crate::geometry::{affine_to_transform, build_clip_mask, raw_path_from_vertices_codes, segments_to_path};
@@ -351,7 +351,7 @@ pub fn render_to_png(scene: &Scene) -> Vec<u8> {
     let base_transform = Transform::from_scale(scale as f32, scale as f32);
 
     for node in &scene.nodes {
-        render_node(&mut pixmap, node, base_transform, 1.0, None);
+        render_node(&mut pixmap, node, base_transform, 1.0, None, None);
     }
 
     encode_pixmap_png(&pixmap)
@@ -373,18 +373,35 @@ pub fn render_to_png_with_blobs(scene: &Scene, blobs: &[&[u8]]) -> Vec<u8> {
     );
     let base_transform = Transform::from_scale(scale as f32, scale as f32);
     for node in &scene.nodes {
-        render_node(&mut pixmap, node, base_transform, 1.0, Some(blobs));
+        render_node(&mut pixmap, node, base_transform, 1.0, Some(blobs), None);
     }
     encode_pixmap_png(&pixmap)
 }
 
 /// Recursively render a single scene node onto the pixmap.
+fn combine_clip_masks(parent: &Mask, child: &Mask) -> Option<Mask> {
+    let w = parent.width();
+    let h = parent.height();
+    if w != child.width() || h != child.height() {
+        return None;
+    }
+    let mut combined = Mask::new(w, h)?;
+    let p_data = parent.data();
+    let c_data = child.data();
+    let out = combined.data_mut();
+    for i in 0..out.len() {
+        out[i] = p_data[i].min(c_data[i]);
+    }
+    Some(combined)
+}
+
 fn render_node(
     pixmap: &mut Pixmap,
     node: &SceneNode,
     parent_transform: Transform,
     parent_alpha: f64,
     blobs: Option<&[&[u8]]>,
+    clip_mask: Option<&Mask>,
 ) {
     match node {
         SceneNode::Group {
@@ -398,53 +415,85 @@ fn render_node(
             let combined_alpha = parent_alpha * alpha;
 
             if let Some(clip_rect) = clip {
-                // Render children into a temporary pixmap and composite with clip.
                 let width = pixmap.width();
                 let height = pixmap.height();
 
                 if let Some(mask) = build_clip_mask(clip_rect, combined, width, height) {
-                    // Calculate clip bounds in pixel coordinates by transforming clip rect corners.
-                    let corners = [
-                        (clip_rect.x as f32, clip_rect.y as f32),
-                        ((clip_rect.x + clip_rect.width) as f32, clip_rect.y as f32),
-                        (clip_rect.x as f32, (clip_rect.y + clip_rect.height) as f32),
-                        ((clip_rect.x + clip_rect.width) as f32, (clip_rect.y + clip_rect.height) as f32),
-                    ];
-                    let mut px_min_x = f32::MAX;
-                    let mut px_min_y = f32::MAX;
-                    let mut px_max_x = f32::MIN;
-                    let mut px_max_y = f32::MIN;
-                    for (lx, ly) in corners {
-                        let px = combined.sx * lx + combined.kx * ly + combined.tx;
-                        let py = combined.ky * lx + combined.sy * ly + combined.ty;
-                        if px < px_min_x { px_min_x = px; }
-                        if py < px_min_y { px_min_y = py; }
-                        if px > px_max_x { px_max_x = px; }
-                        if py > px_max_y { px_max_y = py; }
-                    }
-                    let cx = (px_min_x.floor() as i32).max(0) as u32;
-                    let cy = (px_min_y.floor() as i32).max(0) as u32;
-                    let cw = ((px_max_x.ceil() as u32).min(width)).saturating_sub(cx).max(1);
-                    let ch = ((px_max_y.ceil() as u32).min(height)).saturating_sub(cy).max(1);
+                    // Combine with parent clip mask if present (intersection).
+                    let combined_mask_owned = if clip_mask.is_some() {
+                        clip_mask.and_then(|parent_mask| combine_clip_masks(parent_mask, &mask))
+                    } else {
+                        None
+                    };
+                    let effective_mask: &Mask = combined_mask_owned.as_ref().unwrap_or(&mask);
 
-                    // Use a smaller pixmap if the clip rect is less than 75% of canvas area.
-                    let clip_area = (cw as u64) * (ch as u64);
-                    let canvas_area = (width as u64) * (height as u64);
-                    let use_offset = clip_area * 4 < canvas_area * 3 && cw < width && ch < height;
+                    // FAST PATH: when group alpha is 1.0, render children directly
+                    // with the clip mask instead of allocating a temporary pixmap.
+                    // For binary masks with SourceOver blending this is equivalent.
+                    if combined_alpha >= 1.0 - 1e-9 {
+                        for child in children {
+                            render_node(pixmap, child, combined, combined_alpha, blobs, Some(effective_mask));
+                        }
+                    } else {
+                        // Group opacity requires temp pixmap compositing.
+                        // Calculate clip bounds in pixel coordinates.
+                        let corners = [
+                            (clip_rect.x as f32, clip_rect.y as f32),
+                            ((clip_rect.x + clip_rect.width) as f32, clip_rect.y as f32),
+                            (clip_rect.x as f32, (clip_rect.y + clip_rect.height) as f32),
+                            ((clip_rect.x + clip_rect.width) as f32, (clip_rect.y + clip_rect.height) as f32),
+                        ];
+                        let mut px_min_x = f32::MAX;
+                        let mut px_min_y = f32::MAX;
+                        let mut px_max_x = f32::MIN;
+                        let mut px_max_y = f32::MIN;
+                        for (lx, ly) in corners {
+                            let px = combined.sx * lx + combined.kx * ly + combined.tx;
+                            let py = combined.ky * lx + combined.sy * ly + combined.ty;
+                            if px < px_min_x { px_min_x = px; }
+                            if py < px_min_y { px_min_y = py; }
+                            if px > px_max_x { px_max_x = px; }
+                            if py > px_max_y { px_max_y = py; }
+                        }
+                        let cx = (px_min_x.floor() as i32).max(0) as u32;
+                        let cy = (px_min_y.floor() as i32).max(0) as u32;
+                        let cw = ((px_max_x.ceil() as u32).min(width)).saturating_sub(cx).max(1);
+                        let ch = ((px_max_y.ceil() as u32).min(height)).saturating_sub(cy).max(1);
 
-                    if use_offset {
-                        if let Some(mut tmp) = Pixmap::new(cw, ch) {
-                            // Offset children rendering by -cx, -cy so they render into the smaller pixmap.
-                            let offset = Transform::from_translate(-(cx as f32), -(cy as f32));
-                            let offset_combined = offset.pre_concat(combined);
+                        let clip_area = (cw as u64) * (ch as u64);
+                        let canvas_area = (width as u64) * (height as u64);
+                        let use_offset = clip_area * 4 < canvas_area * 3 && cw < width && ch < height;
+
+                        if use_offset {
+                            if let Some(mut tmp) = Pixmap::new(cw, ch) {
+                                let offset = Transform::from_translate(-(cx as f32), -(cy as f32));
+                                let offset_combined = offset.pre_concat(combined);
+                                for child in children {
+                                    render_node(&mut tmp, child, offset_combined, combined_alpha, blobs, None);
+                                }
+
+                                pixmap.draw_pixmap(
+                                    cx as i32,
+                                    cy as i32,
+                                    tmp.as_ref(),
+                                    &tiny_skia::PixmapPaint {
+                                        opacity: 1.0,
+                                        blend_mode: tiny_skia::BlendMode::SourceOver,
+                                        quality: tiny_skia::FilterQuality::Bilinear,
+                                    },
+                                    Transform::identity(),
+                                    Some(effective_mask),
+                                );
+                            }
+                        } else {
+                            let mut tmp = Pixmap::new(width, height).expect("alloc temp pixmap");
                             for child in children {
-                                render_node(&mut tmp, child, offset_combined, combined_alpha, blobs);
+                                render_node(&mut tmp, child, combined, combined_alpha, blobs, None);
                             }
 
-                            // Composite the temp buffer at the clip position through the clip mask.
                             pixmap.draw_pixmap(
-                                cx as i32,
-                                cy as i32,
+                                0,
+                                0,
                                 tmp.as_ref(),
                                 &tiny_skia::PixmapPaint {
                                     opacity: 1.0,
@@ -452,33 +501,14 @@ fn render_node(
                                     quality: tiny_skia::FilterQuality::Bilinear,
                                 },
                                 Transform::identity(),
-                                Some(&mask),
+                                Some(effective_mask),
                             );
                         }
-                    } else {
-                        // Clip rect covers most of the canvas; use full-size temp pixmap.
-                        let mut tmp = Pixmap::new(width, height).expect("alloc temp pixmap");
-                        for child in children {
-                            render_node(&mut tmp, child, combined, combined_alpha, blobs);
-                        }
-
-                        pixmap.draw_pixmap(
-                            0,
-                            0,
-                            tmp.as_ref(),
-                            &tiny_skia::PixmapPaint {
-                                opacity: 1.0,
-                                blend_mode: tiny_skia::BlendMode::SourceOver,
-                                quality: tiny_skia::FilterQuality::Bilinear,
-                            },
-                            Transform::identity(),
-                            Some(&mask),
-                        );
                     }
                 }
             } else {
                 for child in children {
-                    render_node(pixmap, child, combined, combined_alpha, blobs);
+                    render_node(pixmap, child, combined, combined_alpha, blobs, clip_mask);
                 }
             }
         }
@@ -495,16 +525,14 @@ fn render_node(
             if let Some(path) = segments_to_path(segments) {
                 if let Some(fill_style) = fill {
                     let paint = make_fill_paint(&fill_style.color, parent_alpha);
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, combined, None);
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, combined, clip_mask);
                 }
 
                 if let Some(stroke_style) = stroke {
                     let paint = make_fill_paint(&stroke_style.color, parent_alpha);
                     let sk_stroke = make_stroke(stroke_style, parent_transform);
-                    // Shift stroke by +0.5px to convert from matplotlib's
-                    // pixel-center convention to tiny_skia's pixel-edge convention.
                     let stroke_transform = combined.pre_concat(Transform::from_translate(0.5, 0.5));
-                    pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, None);
+                    pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, clip_mask);
                 }
             }
         }
@@ -565,13 +593,13 @@ fn render_node(
             if let Some(path) = raw_path_from_vertices_codes(verts_raw, codes_raw, *count, *snap, vertices_dtype) {
                 if let Some(fill_style) = fill {
                     let paint = make_fill_paint(&fill_style.color, parent_alpha);
-                    pixmap.fill_path(&path, &paint, FillRule::Winding, combined, None);
+                    pixmap.fill_path(&path, &paint, FillRule::Winding, combined, clip_mask);
                 }
                 if let Some(stroke_style) = stroke {
                     let paint = make_fill_paint(&stroke_style.color, parent_alpha);
                     let sk_stroke = make_stroke(stroke_style, parent_transform);
                     let stroke_transform = combined.pre_concat(Transform::from_translate(0.5, 0.5));
-                    pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, None);
+                    pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, clip_mask);
                 }
             }
         }
@@ -638,7 +666,7 @@ fn render_node(
                         quality: tiny_skia::FilterQuality::Nearest,
                     },
                     img_transform,
-                    None,
+                    clip_mask,
                 );
             }
         }
@@ -671,7 +699,7 @@ fn render_node(
                         let paint = make_fill_paint(&stroke_style.color, parent_alpha);
                         let sk_stroke = make_stroke(stroke_style, parent_transform);
                         let stroke_transform = combined.pre_concat(Transform::from_translate(0.5, 0.5));
-                        pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, None);
+                        pixmap.stroke_path(&path, &paint, &sk_stroke, stroke_transform, clip_mask);
                     }
                 }
             }
@@ -776,6 +804,7 @@ fn render_node(
                 combined,
                 parent_transform,
                 parent_alpha,
+                clip_mask,
             );
         }
 
@@ -868,7 +897,7 @@ fn render_node(
                         quality: text_filter,
                     },
                     draw_transform,
-                    None,
+                    clip_mask,
                 );
             }
         }
@@ -895,6 +924,7 @@ fn render_node(
                 combined,
                 parent_transform,
                 parent_alpha,
+                clip_mask,
             );
         }
 
@@ -909,9 +939,66 @@ fn render_node(
             stroke,
             positions_transform,
             transform,
+            fill_colors_data,
+            fill_colors_blob,
+            fill_colors_dtype,
         } => {
             let local = affine_to_transform(transform);
             let combined = parent_transform.pre_concat(local);
+
+            // Resolve per-point fill colors (if present).
+            let fill_colors_raw_owned = if fill_colors_blob.is_some() {
+                None
+            } else {
+                fill_colors_data
+                    .as_ref()
+                    .and_then(|s| base64_decode(s).ok())
+            };
+            let fill_colors_raw: Option<&[u8]> = if let Some(blob_idx) = fill_colors_blob {
+                blobs
+                    .and_then(|all| all.get(*blob_idx))
+                    .copied()
+            } else {
+                fill_colors_raw_owned.as_deref()
+            };
+
+            // Per-point color path: each marker gets its own fill color.
+            if let Some(fc_raw) = fill_colors_raw {
+                let positions_raw_owned;
+                let positions_raw: &[u8] = if let Some(blob_idx) = positions_blob {
+                    match blobs.and_then(|all| all.get(*blob_idx)) {
+                        Some(b) => b,
+                        None => return,
+                    }
+                } else if let Some(b64) = positions_data.as_ref() {
+                    positions_raw_owned = match base64_decode(b64) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    &positions_raw_owned
+                } else {
+                    return;
+                };
+
+                let _ = render_markers_data_per_color_raw(
+                    pixmap,
+                    marker_path,
+                    positions_raw,
+                    positions_dtype,
+                    *count,
+                    *size,
+                    fc_raw,
+                    fill_colors_dtype,
+                    stroke,
+                    positions_transform.as_ref(),
+                    combined,
+                    parent_transform,
+                    parent_alpha,
+                    clip_mask,
+                );
+                return;
+            }
+
             let _ = if let Some(blob_idx) = positions_blob {
                 blobs
                     .and_then(|all| all.get(*blob_idx))
@@ -930,6 +1017,7 @@ fn render_node(
                             combined,
                             parent_transform,
                             parent_alpha,
+                            clip_mask,
                         )
                     })
             } else if let Some(positions_b64) = positions_data.as_ref() {
@@ -946,6 +1034,7 @@ fn render_node(
                     combined,
                     parent_transform,
                     parent_alpha,
+                    clip_mask,
                 )
             } else {
                 Err("markers_data requires positions_data or positions_blob".to_string())
@@ -1001,7 +1090,7 @@ fn render_node(
                                 quality: tiny_skia::FilterQuality::Nearest,
                             },
                             img_transform,
-                            None,
+                            clip_mask,
                         );
                     }
                 }
@@ -1081,7 +1170,7 @@ fn render_node(
                             quality: interpolation_quality(interpolation),
                         },
                         img_transform,
-                        None,
+                        clip_mask,
                     );
                 }
             }
@@ -1559,6 +1648,7 @@ fn render_polygons_data_raw(
     combined: Transform,
     parent_transform: Transform,
     parent_alpha: f64,
+    clip_mask: Option<&Mask>,
 ) -> Result<(), String> {
     let points = decode_xy_points_raw(points_raw, points_dtype, point_count)?;
     let ring_sizes = decode_ring_sizes_raw(ring_sizes_raw, ring_sizes_dtype, polygon_count)?;
@@ -1629,17 +1719,17 @@ fn render_polygons_data_raw(
         if let Some(colors) = fill_colors.as_ref() {
             if let Some(color) = colors.get(poly_i) {
                 let paint = make_fill_paint(color, parent_alpha);
-                pixmap.fill_path(&path, &paint, FillRule::Winding, combined, None);
+                pixmap.fill_path(&path, &paint, FillRule::Winding, combined, clip_mask);
             } else if let Some(paint) = uniform_fill_paint.as_ref() {
-                pixmap.fill_path(&path, paint, FillRule::Winding, combined, None);
+                pixmap.fill_path(&path, paint, FillRule::Winding, combined, clip_mask);
             }
         } else if let Some(paint) = uniform_fill_paint.as_ref() {
-            pixmap.fill_path(&path, paint, FillRule::Winding, combined, None);
+            pixmap.fill_path(&path, paint, FillRule::Winding, combined, clip_mask);
         }
 
         if let (Some(paint), Some(stroke_shape)) = (stroke_paint.as_ref(), stroke_shape.as_ref()) {
             let stroke_transform = combined.pre_concat(Transform::from_translate(0.5, 0.5));
-            pixmap.stroke_path(&path, paint, stroke_shape, stroke_transform, None);
+            pixmap.stroke_path(&path, paint, stroke_shape, stroke_transform, clip_mask);
         }
     }
 
@@ -1659,6 +1749,7 @@ fn render_markers_positions_base64_interleaved(
     combined: Transform,
     parent_transform: Transform,
     parent_alpha: f64,
+    clip_mask: Option<&Mask>,
 ) -> Result<(), String> {
     let raw = base64_decode(points_b64)?;
     render_markers_positions_raw_interleaved(
@@ -1674,7 +1765,96 @@ fn render_markers_positions_base64_interleaved(
         combined,
         parent_transform,
         parent_alpha,
+        clip_mask,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_markers_data_per_color_raw(
+    pixmap: &mut Pixmap,
+    marker_path: &[crate::scene::PathSegment],
+    positions_raw: &[u8],
+    positions_dtype: &str,
+    count: usize,
+    size: f64,
+    fill_colors_raw: &[u8],
+    fill_colors_dtype: &str,
+    stroke: &Option<StrokeStyle>,
+    positions_transform: Option<&[f64; 6]>,
+    combined: Transform,
+    parent_transform: Transform,
+    parent_alpha: f64,
+    clip_mask: Option<&Mask>,
+) -> Result<(), String> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let Some(path) = segments_to_path(marker_path) else {
+        return Ok(());
+    };
+
+    let marker_scale = size as f32;
+    if marker_scale <= 0.0 {
+        return Ok(());
+    }
+
+    // Decode per-point fill colors.
+    let fill_colors = decode_rgba_rows_raw(fill_colors_raw, fill_colors_dtype, count)?;
+
+    // Determine position decoding.
+    let normalized = normalized_dtype(positions_dtype);
+    let bytes_per_point: usize = match normalized {
+        "f32" => 8,
+        "f64" => 16,
+        other => return Err(format!("unsupported positions dtype: {}", other)),
+    };
+    let expected = count
+        .checked_mul(bytes_per_point)
+        .ok_or_else(|| "positions byte-size overflow".to_string())?;
+    if positions_raw.len() != expected {
+        return Err(format!(
+            "positions byte-size mismatch: expected {}, got {}",
+            expected,
+            positions_raw.len()
+        ));
+    }
+
+    let scaled_sx = combined.sx * marker_scale;
+    let scaled_ky = combined.ky * marker_scale;
+    let scaled_kx = combined.kx * marker_scale;
+    let scaled_sy = combined.sy * marker_scale;
+    let positions_affine = position_affine_from_opt(positions_transform);
+
+    let sk_stroke = stroke
+        .as_ref()
+        .map(|s| make_marker_stroke(s, parent_transform, marker_scale));
+    let stroke_paint = stroke
+        .as_ref()
+        .map(|s| make_fill_paint(&s.color, parent_alpha));
+
+    for (i, chunk) in positions_raw.chunks_exact(bytes_per_point).enumerate() {
+        let (x_raw, y_raw) = if normalized == "f32" {
+            decode_point_interleaved_f32(chunk)
+        } else {
+            decode_point_interleaved_f64(chunk)
+        };
+        let (x, y) = apply_position_affine(positions_affine, x_raw, y_raw);
+        let marker_transform =
+            marker_transform_for_point(combined, scaled_sx, scaled_ky, scaled_kx, scaled_sy, x, y);
+
+        if let Some(color) = fill_colors.get(i) {
+            let paint = make_fill_paint(color, parent_alpha);
+            pixmap.fill_path(&path, &paint, FillRule::Winding, marker_transform, clip_mask);
+        }
+
+        if let (Some(paint), Some(stroke_shape)) = (stroke_paint.as_ref(), sk_stroke.as_ref()) {
+            let stroke_mt = marker_transform.pre_concat(Transform::from_translate(0.5, 0.5));
+            pixmap.stroke_path(&path, paint, stroke_shape, stroke_mt, clip_mask);
+        }
+    }
+
+    Ok(())
 }
 
 fn render_markers_positions_raw_interleaved(
@@ -1690,6 +1870,7 @@ fn render_markers_positions_raw_interleaved(
     combined: Transform,
     parent_transform: Transform,
     parent_alpha: f64,
+    clip_mask: Option<&Mask>,
 ) -> Result<(), String> {
     if count == 0 {
         return Ok(());
@@ -1711,6 +1892,7 @@ fn render_markers_positions_raw_interleaved(
             combined,
             parent_transform,
             parent_alpha,
+            clip_mask,
         ),
         "f64" => render_markers_positions_raw_impl(
             pixmap,
@@ -1726,6 +1908,7 @@ fn render_markers_positions_raw_interleaved(
             combined,
             parent_transform,
             parent_alpha,
+            clip_mask,
         ),
         other => Err(format!("unsupported points dtype: {}", other)),
     }
@@ -1763,6 +1946,7 @@ fn render_markers_positions_raw_impl<F>(
     combined: Transform,
     parent_transform: Transform,
     parent_alpha: f64,
+    clip_mask: Option<&Mask>,
 ) -> Result<(), String>
 where
     F: Fn(&[u8]) -> (f32, f32) + Copy + Send + Sync,
@@ -1806,7 +1990,7 @@ where
     let skip_dense_stroke = should_skip_dense_marker_stroke(dense_tiny_markers, size, fill, stroke);
     let circle_like_marker = is_circle_like_marker_path(marker_path);
 
-    // ── General stamp-cache fast path ─────────────────────────────────
+    // ── Stamp-cache fast path (supports clip_mask) ──────────────────────
     // Rasterize the marker once, blit at each position.
     if try_render_markers_stamp_raw(
         pixmap,
@@ -1828,9 +2012,14 @@ where
         scaled_kx,
         scaled_sy,
         positions_affine,
+        clip_mask,
     ) {
         return Ok(());
     }
+
+    // ── Raw-pixel fast paths (no clip_mask support) ──────────────────
+    // These use direct pixel manipulation and can't apply a mask.
+    if clip_mask.is_none() {
 
     if should_use_marker_stamp_fastpath()
         && skip_dense_stroke
@@ -1903,6 +2092,9 @@ where
         }
     }
 
+    } // end clip_mask.is_none() guard for raw-pixel paths
+
+    // ── Parallel workers (supports clip_mask via composite) ──────────
     if use_parallel && count >= 25_000 {
         let max_threads = thread::available_parallelism()
             .map(|n| n.get())
@@ -2029,7 +2221,7 @@ where
                                     quality: tiny_skia::FilterQuality::Bilinear,
                                 },
                                 Transform::identity(),
-                                None,
+                                clip_mask,
                             );
                         }
                     }
@@ -2041,6 +2233,7 @@ where
         }
     }
 
+    // ── Sequential fallback (supports clip_mask) ─────────────────────
     let mut fill_paint = fill
         .as_ref()
         .map(|fill_style| make_fill_paint(&fill_style.color, parent_alpha));
@@ -2074,12 +2267,12 @@ where
             marker_transform_for_point(combined, scaled_sx, scaled_ky, scaled_kx, scaled_sy, x, y);
 
         if let Some(paint) = fill_paint.as_ref() {
-            pixmap.fill_path(&path, paint, FillRule::Winding, marker_transform, None);
+            pixmap.fill_path(&path, paint, FillRule::Winding, marker_transform, clip_mask);
         }
 
         if let (Some(paint), Some(stroke_shape)) = (stroke_paint.as_ref(), sk_stroke.as_ref()) {
             let stroke_mt = marker_transform.pre_concat(Transform::from_translate(0.5, 0.5));
-            pixmap.stroke_path(&path, paint, stroke_shape, stroke_mt, None);
+            pixmap.stroke_path(&path, paint, stroke_shape, stroke_mt, clip_mask);
         }
     }
 
@@ -2109,6 +2302,7 @@ fn try_render_markers_stamp_raw<F>(
     scaled_kx: f32,
     scaled_sy: f32,
     positions_affine: Option<PositionAffine>,
+    clip_mask: Option<&Mask>,
 ) -> bool
 where
     F: Fn(&[u8]) -> (f32, f32),
@@ -2193,16 +2387,46 @@ where
     let stamp_bytes = stamp.data();
     let dst_w = pixmap.width();
     let dst_h = pixmap.height();
-    let dst_data = pixmap.data_mut();
 
-    for chunk in raw.chunks_exact(bytes_per_point).take(count) {
-        let (x_raw, y_raw) = decode_point(chunk);
-        let (px, py) = apply_position_affine(positions_affine, x_raw, y_raw);
-        let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
-        let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
-        let blit_x = (screen_tx + min_x).round() as i32;
-        let blit_y = (screen_ty + min_y).round() as i32;
-        fast_blit_stamp(dst_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+    if clip_mask.is_some() {
+        // Masked path: render all stamps into a temp pixmap via fast blit,
+        // then composite once through the clip mask.
+        if let Some(mut tmp) = Pixmap::new(dst_w, dst_h) {
+            let tmp_data = tmp.data_mut();
+            for chunk in raw.chunks_exact(bytes_per_point).take(count) {
+                let (x_raw, y_raw) = decode_point(chunk);
+                let (px, py) = apply_position_affine(positions_affine, x_raw, y_raw);
+                let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
+                let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
+                let blit_x = (screen_tx + min_x).round() as i32;
+                let blit_y = (screen_ty + min_y).round() as i32;
+                fast_blit_stamp(tmp_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+            }
+            pixmap.draw_pixmap(
+                0, 0, tmp.as_ref(),
+                &tiny_skia::PixmapPaint {
+                    opacity: 1.0,
+                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                    quality: tiny_skia::FilterQuality::Bilinear,
+                },
+                Transform::identity(),
+                clip_mask,
+            );
+        } else {
+            return false;
+        }
+    } else {
+        // Unmasked fast path: direct pixel blit.
+        let dst_data = pixmap.data_mut();
+        for chunk in raw.chunks_exact(bytes_per_point).take(count) {
+            let (x_raw, y_raw) = decode_point(chunk);
+            let (px, py) = apply_position_affine(positions_affine, x_raw, y_raw);
+            let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
+            let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
+            let blit_x = (screen_tx + min_x).round() as i32;
+            let blit_y = (screen_ty + min_y).round() as i32;
+            fast_blit_stamp(dst_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+        }
     }
 
     true
@@ -2228,6 +2452,7 @@ fn try_render_markers_stamp<P: Point2>(
     scaled_kx: f32,
     scaled_sy: f32,
     positions_affine: Option<PositionAffine>,
+    clip_mask: Option<&Mask>,
 ) -> bool {
     // Compute the transformed bounding box of the marker path.
     let bounds = path.bounds();
@@ -2312,19 +2537,48 @@ fn try_render_markers_stamp<P: Point2>(
         return true; // nothing visible
     }
 
-    // Blit stamp at each position using direct pixel blending.
     let stamp_bytes = stamp.data();
     let dst_w = pixmap.width();
     let dst_h = pixmap.height();
-    let dst_data = pixmap.data_mut();
 
-    for pos in positions {
-        let (px, py) = apply_position_affine(positions_affine, pos.x_f32(), pos.y_f32());
-        let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
-        let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
-        let blit_x = (screen_tx + min_x).round() as i32;
-        let blit_y = (screen_ty + min_y).round() as i32;
-        fast_blit_stamp(dst_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+    if clip_mask.is_some() {
+        // Masked path: render all stamps into a temp pixmap via fast blit,
+        // then composite once through the clip mask.
+        if let Some(mut tmp) = Pixmap::new(dst_w, dst_h) {
+            let tmp_data = tmp.data_mut();
+            for pos in positions {
+                let (px, py) = apply_position_affine(positions_affine, pos.x_f32(), pos.y_f32());
+                let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
+                let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
+                let blit_x = (screen_tx + min_x).round() as i32;
+                let blit_y = (screen_ty + min_y).round() as i32;
+                fast_blit_stamp(tmp_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+            }
+            pixmap.draw_pixmap(
+                0, 0, tmp.as_ref(),
+                &tiny_skia::PixmapPaint {
+                    opacity: 1.0,
+                    blend_mode: tiny_skia::BlendMode::SourceOver,
+                    quality: tiny_skia::FilterQuality::Bilinear,
+                },
+                Transform::identity(),
+                clip_mask,
+            );
+        } else {
+            return false;
+        }
+    } else {
+        // Unmasked fast path: direct pixel blit.
+        let dst_data = pixmap.data_mut();
+
+        for pos in positions {
+            let (px, py) = apply_position_affine(positions_affine, pos.x_f32(), pos.y_f32());
+            let screen_tx = combined.sx * px + combined.kx * py + combined.tx;
+            let screen_ty = combined.ky * px + combined.sy * py + combined.ty;
+            let blit_x = (screen_tx + min_x).round() as i32;
+            let blit_y = (screen_ty + min_y).round() as i32;
+            fast_blit_stamp(dst_data, dst_w, dst_h, stamp_bytes, stamp_w, stamp_h, blit_x, blit_y);
+        }
     }
 
     true
@@ -2341,6 +2595,7 @@ fn render_markers_positions<P: Point2 + Sync>(
     combined: Transform,
     parent_transform: Transform,
     parent_alpha: f64,
+    clip_mask: Option<&Mask>,
 ) {
     if positions.is_empty() {
         return;
@@ -2368,10 +2623,7 @@ fn render_markers_positions<P: Point2 + Sync>(
     let skip_dense_stroke = should_skip_dense_marker_stroke(dense_tiny_markers, size, fill, stroke);
     let positions_affine = position_affine_from_opt(positions_transform);
 
-    // ── Stamp-cache fast path ──────────────────────────────────────────
-    // Rasterize the marker once into a small pixmap, then blit at each
-    // position.  This avoids re-rasterizing the path for every marker and
-    // is the same strategy Agg uses.
+    // ── Stamp-cache fast path (supports clip_mask) ────────────────────
     if try_render_markers_stamp(
         pixmap,
         &path,
@@ -2389,10 +2641,12 @@ fn render_markers_positions<P: Point2 + Sync>(
         scaled_kx,
         scaled_sy,
         positions_affine,
+        clip_mask,
     ) {
         return;
     }
 
+    // ── Parallel workers (supports clip_mask via composite) ──────────
     if use_parallel && positions.len() >= 25_000 {
         let max_threads = thread::available_parallelism()
             .map(|n| n.get())
@@ -2516,7 +2770,7 @@ fn render_markers_positions<P: Point2 + Sync>(
                                     quality: tiny_skia::FilterQuality::Bilinear,
                                 },
                                 Transform::identity(),
-                                None,
+                                clip_mask,
                             );
                         }
                     }
@@ -2528,6 +2782,7 @@ fn render_markers_positions<P: Point2 + Sync>(
         }
     }
 
+    // ── Sequential fallback (supports clip_mask) ─────────────────────
     let mut fill_paint = fill
         .as_ref()
         .map(|fill_style| make_fill_paint(&fill_style.color, parent_alpha));
@@ -2560,12 +2815,12 @@ fn render_markers_positions<P: Point2 + Sync>(
             marker_transform_for_point(combined, scaled_sx, scaled_ky, scaled_kx, scaled_sy, x, y);
 
         if let Some(paint) = fill_paint.as_ref() {
-            pixmap.fill_path(&path, paint, FillRule::Winding, marker_transform, None);
+            pixmap.fill_path(&path, paint, FillRule::Winding, marker_transform, clip_mask);
         }
 
         if let (Some(paint), Some(stroke_shape)) = (stroke_paint.as_ref(), sk_stroke.as_ref()) {
             let stroke_mt = marker_transform.pre_concat(Transform::from_translate(0.5, 0.5));
-            pixmap.stroke_path(&path, paint, stroke_shape, stroke_mt, None);
+            pixmap.stroke_path(&path, paint, stroke_shape, stroke_mt, clip_mask);
         }
     }
 }
